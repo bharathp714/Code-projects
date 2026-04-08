@@ -97,7 +97,10 @@ if ($rebootSources.Count -gt 0) {
 }
 
 # ── Step 4 : Windows Update history — get driver name + version ───────────────
-# Broadened filter to catch generically titled WU driver updates.
+# Searches WU install history for Lenovo-related driver updates in last 30 days.
+# FIX: After matching, we cross-validate the title against the actual INF vendor.
+# If the WU title belongs to a different vendor (Intel, Realtek etc.), it is
+# discarded so the INF parsing in Step 9 can provide the correct name instead.
 if ($result.RestartPending -eq "Yes") {
     try {
         $updateSession  = New-Object -ComObject Microsoft.Update.Session
@@ -108,18 +111,25 @@ if ($result.RestartPending -eq "Yes") {
             $history = $updateSearcher.QueryHistory(0, [Math]::Min($historyCount, 200))
             $cutoff  = (Get-Date).AddDays(-30)
 
+            # Primary: Lenovo-explicit titles only (most trustworthy)
             $lenovoDriverUpdate = $history | Where-Object {
                 $_.ResultCode -eq 2 -and
                 $_.Date       -ge $cutoff -and
                 (
-                    $_.Title       -match "(?i)lenovo"   -or
-                    $_.Description -match "(?i)lenovo"   -or
-                    (
-                        $_.Title -match "(?i)driver|(?i)audio|(?i)sound|(?i)network|(?i)bluetooth|(?i)firmware|(?i)chipset|(?i)video|(?i)display|(?i)storage|(?i)thunderbolt|(?i)fingerprint|(?i)camera" -and
-                        $_.Title -notmatch "(?i)microsoft|(?i)windows defender|(?i)office"
-                    )
+                    $_.Title       -match "(?i)lenovo" -or
+                    $_.Description -match "(?i)lenovo"
                 )
             } | Sort-Object Date -Descending | Select-Object -First 1
+
+            # Secondary: broader driver keyword match only if no Lenovo-explicit hit
+            if (-not $lenovoDriverUpdate) {
+                $lenovoDriverUpdate = $history | Where-Object {
+                    $_.ResultCode -eq 2 -and
+                    $_.Date       -ge $cutoff -and
+                    $_.Title -match "(?i)driver|(?i)audio|(?i)sound|(?i)network|(?i)bluetooth|(?i)firmware|(?i)chipset|(?i)video|(?i)display|(?i)storage|(?i)thunderbolt|(?i)fingerprint|(?i)camera" -and
+                    $_.Title -notmatch "(?i)microsoft|(?i)windows defender|(?i)office|(?i)intel|(?i)realtek|(?i)broadcom|(?i)qualcomm|(?i)nvidia|(?i)amd"
+                } | Sort-Object Date -Descending | Select-Object -First 1
+            }
 
             if ($lenovoDriverUpdate) {
                 $result.DriverName      = $lenovoDriverUpdate.Title
@@ -184,10 +194,10 @@ if ($result.RestartPending -eq "Yes") {
 }
 
 # ── Step 6 : Driver Store — get INF base name + built date + version ──────────
-# Get-WindowsDriver returns the INF filename and Lenovo-authored date.
-# $infBaseName and $driverStoreFolder are passed to Steps 7, 8 and 9.
-$infBaseName        = $null
-$driverStoreFolder  = $null
+# Get-WindowsDriver returns INF filename and Lenovo-authored date.
+# $infBaseName and $driverStoreFolder are used in Steps 7, 8 and 9.
+$infBaseName       = $null
+$driverStoreFolder = $null
 
 if ($result.RestartPending -eq "Yes") {
     try {
@@ -205,12 +215,12 @@ if ($result.RestartPending -eq "Yes") {
                 $lenovoDriver.Date.ToString("yyyy-MM-dd")
             } else { "N/A" }
 
-            # Version from Driver Store if not yet resolved from WU history
+            # Version from Driver Store if not yet resolved
             if ($result.DriverVersion -eq "N/A" -and $lenovoDriver.Version) {
                 $result.DriverVersion = $lenovoDriver.Version
             }
 
-            # Locate the DriverStore folder now — used in Steps 8 and 9
+            # Locate DriverStore folder — used in Steps 8 and 9
             $driverStoreRoot   = "C:\Windows\System32\DriverStore\FileRepository"
             $driverStoreFolder = Get-ChildItem -Path $driverStoreRoot -Directory `
                                  -ErrorAction SilentlyContinue |
@@ -219,6 +229,17 @@ if ($result.RestartPending -eq "Yes") {
                                  Select-Object -First 1
 
             $result.DetectionSource += " | DriverStore-Enriched"
+
+            # FIX: Cross-validate WU history name against the actual Lenovo INF.
+            # If the resolved driver name doesn't mention Lenovo AND the INF name
+            # is a known Lenovo prefix (lnv*), the WU history matched the wrong
+            # driver (e.g. Intel). Reset so INF parsing takes over in Step 9.
+            if ($result.DriverName -ne "N/A" -and
+                $result.DriverName -notmatch "(?i)lenovo" -and
+                $infBaseName -match "^lnv") {
+                $result.DriverName       = "N/A"
+                $result.DetectionSource += " | WU-History-Overridden(non-Lenovo-title)"
+            }
         }
     }
     catch {
@@ -227,10 +248,9 @@ if ($result.RestartPending -eq "Yes") {
 }
 
 # ── Step 7 : Win32_PnPSignedDriver.DeviceName — precise friendly name ─────────
-# Match directly on INF filename. DeviceName is tied exactly to that INF.
-# Works for standard PnP drivers. Kernel filter drivers (like lnvvsndmft)
-# return empty here — those fall through to Step 9 INF parsing.
-if ($result.RestartPending -eq "Yes" -and $infBaseName) {
+# Works for standard PnP drivers. Kernel filter drivers return empty here
+# and fall through to Step 9 INF parsing.
+if ($result.RestartPending -eq "Yes" -and $infBaseName -and $result.DriverName -eq "N/A") {
     try {
         $pnpSigned = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
                      Where-Object { $_.InfName -like "$infBaseName*" } |
@@ -242,7 +262,7 @@ if ($result.RestartPending -eq "Yes" -and $infBaseName) {
         elseif ($pnpSigned -and $pnpSigned.Description -and $pnpSigned.Description -ne "") {
             $result.DriverName = $pnpSigned.Description
         }
-        # If both empty — kernel filter driver — fall through to Step 9 INF parsing
+        # Empty = kernel filter driver — falls through to Step 9
     }
     catch {
         $result.DetectionSource += " | PnPSignedDriver-ReadError"
@@ -251,7 +271,6 @@ if ($result.RestartPending -eq "Yes" -and $infBaseName) {
 
 # ── Step 8 : DriverStore folder creation date — actual WU install date ─────────
 # The FileRepository folder is created at the exact moment WU stages the driver.
-# This is the most accurate install timestamp available on the device.
 if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
     try {
         $result.DriverInstallDate = $driverStoreFolder.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
@@ -262,20 +281,20 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
     }
 }
 
-# ── Step 9 : INF file [Strings] parsing — final driver name fallback ───────────
-# FIX: Kernel audio filter drivers (e.g. lnvvsndmft.inf) don't register a
-# standard PnP device so Win32_PnPSignedDriver.DeviceName returns empty.
-# The INF file itself always contains a human-readable description in its
-# [Strings] section under DriverDesc or in the [Version] section under Class.
-# Reading directly from the INF is the most reliable last resort.
-#
-# Example INF [Strings] section:
-#   DriverDesc  = "Lenovo Sound Filter Driver"
-#   MfgName     = "Lenovo"
-#
-if ($result.RestartPending -eq "Yes" -and
+# ── Step 9 : INF file [Strings] parsing — driver name from INF itself ──────────
+# Triggered when:
+#   - DriverName is still N/A (PnP lookup failed — kernel filter driver), OR
+#   - DriverName doesn't contain "Lenovo" (WU history returned wrong vendor)
+# Reads the INF directly from the DriverStore folder.
+# Priority order: DriverDesc → ProductName → Description → Class
+$needsInfParsing = (
+    $result.RestartPending -eq "Yes" -and
     $driverStoreFolder -and
-    ($result.DriverName -eq "N/A" -or $result.DriverName -like "*(INF)*")) {
+    $infBaseName -and
+    ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo")
+)
+
+if ($needsInfParsing) {
     try {
         $infFile = Get-ChildItem -Path $driverStoreFolder.FullName `
                    -Filter "$infBaseName.inf" -ErrorAction SilentlyContinue |
@@ -296,7 +315,7 @@ if ($result.RestartPending -eq "Yes" -and
             }
 
             # Priority 2 — ProductName in [Strings] section
-            if ($result.DriverName -eq "N/A" -or $result.DriverName -like "*(INF)*") {
+            if ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo") {
                 $productLine = $infContent | Select-String '^\s*ProductName\s*=' |
                                Select-Object -First 1
                 if ($productLine) {
@@ -309,7 +328,7 @@ if ($result.RestartPending -eq "Yes" -and
             }
 
             # Priority 3 — Description under [Version] section
-            if ($result.DriverName -eq "N/A" -or $result.DriverName -like "*(INF)*") {
+            if ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo") {
                 $versionDesc = $infContent | Select-String '^\s*Description\s*=' |
                                Select-Object -First 1
                 if ($versionDesc) {
@@ -322,7 +341,7 @@ if ($result.RestartPending -eq "Yes" -and
             }
 
             # Priority 4 — Class name from [Version] as last meaningful fallback
-            if ($result.DriverName -eq "N/A" -or $result.DriverName -like "*(INF)*") {
+            if ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo") {
                 $classLine = $infContent | Select-String '^\s*ClassDesc\s*=|^\s*Class\s*=' |
                              Select-Object -First 1
                 if ($classLine) {
@@ -339,8 +358,8 @@ if ($result.RestartPending -eq "Yes" -and
         $result.DetectionSource += " | INF-ParseError"
     }
 
-    # Absolute last resort — clean INF basename is better than "(INF)" suffix
-    if ($result.DriverName -eq "N/A" -or $result.DriverName -like "*(INF)*") {
+    # Absolute last resort — clean INF basename without (INF) suffix
+    if ($result.DriverName -eq "N/A") {
         $result.DriverName = $infBaseName
     }
 }
@@ -381,4 +400,3 @@ Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
 # Exit 1 = Restart pending (non-compliant — triggers remediation action)
 # Exit 0 = No restart pending (compliant)
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
-
