@@ -6,7 +6,8 @@
 #           Driver Built Date, Actual Install Date on Device
 # Sources : WU registry keys, WU history (COM), WU event log,
 #           Windows Driver Store, Win32_PnPSignedDriver.DeviceName,
-#           DriverStore folder creation date, INF file [Strings] section
+#           DriverStore folder creation date, INF file [Strings] section,
+#           Hardware ID to PnP device name mapping
 # Usage   : Run locally, via Nexthink Remote Action, or Intune Proactive
 #           Remediation (detection script)
 # =============================================================================
@@ -21,6 +22,17 @@ $result = [PSCustomObject]@{
     DriverBuiltDate   = "N/A"   # Date Lenovo authored/signed the driver package
     DriverInstallDate = "N/A"   # Date WU actually installed it on this device
     DetectionSource   = "N/A"
+}
+
+# ── Helper : Test if driver name is still unresolved or too generic ───────────
+function NameNeedsResolution {
+    param($name)
+    return (
+        $name -eq "N/A"                          -or
+        $name -notmatch "(?i)lenovo"             -or
+        $name -match "(?i)^lenovo extension"     -or   # Generic INF class fallback
+        $name -match "(?i)^lenovo \w+ driver$"         # e.g. "Lenovo Audio Driver" from class
+    )
 }
 
 # ── Step 1 : Confirm this is a Lenovo device ─────────────────────────────────
@@ -97,10 +109,8 @@ if ($rebootSources.Count -gt 0) {
 }
 
 # ── Step 4 : Windows Update history — get driver name + version ───────────────
-# Searches WU install history for Lenovo-related driver updates in last 30 days.
-# FIX: After matching, we cross-validate the title against the actual INF vendor.
-# If the WU title belongs to a different vendor (Intel, Realtek etc.), it is
-# discarded so the INF parsing in Step 9 can provide the correct name instead.
+# Two-pass search: Lenovo-explicit first, then broader driver keywords
+# excluding known non-Lenovo vendors.
 if ($result.RestartPending -eq "Yes") {
     try {
         $updateSession  = New-Object -ComObject Microsoft.Update.Session
@@ -111,7 +121,7 @@ if ($result.RestartPending -eq "Yes") {
             $history = $updateSearcher.QueryHistory(0, [Math]::Min($historyCount, 200))
             $cutoff  = (Get-Date).AddDays(-30)
 
-            # Primary: Lenovo-explicit titles only (most trustworthy)
+            # Primary: Lenovo-explicit titles only
             $lenovoDriverUpdate = $history | Where-Object {
                 $_.ResultCode -eq 2 -and
                 $_.Date       -ge $cutoff -and
@@ -121,7 +131,7 @@ if ($result.RestartPending -eq "Yes") {
                 )
             } | Sort-Object Date -Descending | Select-Object -First 1
 
-            # Secondary: broader driver keyword match only if no Lenovo-explicit hit
+            # Secondary: driver keywords excluding other known vendors
             if (-not $lenovoDriverUpdate) {
                 $lenovoDriverUpdate = $history | Where-Object {
                     $_.ResultCode -eq 2 -and
@@ -193,11 +203,10 @@ if ($result.RestartPending -eq "Yes") {
     }
 }
 
-# ── Step 6 : Driver Store — get INF base name + built date + version ──────────
-# Get-WindowsDriver returns INF filename and Lenovo-authored date.
-# $infBaseName and $driverStoreFolder are used in Steps 7, 8 and 9.
+# ── Step 6 : Driver Store — INF base name + built date + version ──────────────
 $infBaseName       = $null
 $driverStoreFolder = $null
+$infContent        = $null
 
 if ($result.RestartPending -eq "Yes") {
     try {
@@ -210,17 +219,15 @@ if ($result.RestartPending -eq "Yes") {
             $infBaseName = [System.IO.Path]::GetFileNameWithoutExtension(
                                $lenovoDriver.OriginalFileName)
 
-            # DriverBuiltDate = when Lenovo signed/authored this driver package
             $result.DriverBuiltDate = if ($lenovoDriver.Date) {
                 $lenovoDriver.Date.ToString("yyyy-MM-dd")
             } else { "N/A" }
 
-            # Version from Driver Store if not yet resolved
             if ($result.DriverVersion -eq "N/A" -and $lenovoDriver.Version) {
                 $result.DriverVersion = $lenovoDriver.Version
             }
 
-            # Locate DriverStore folder — used in Steps 8 and 9
+            # Locate DriverStore folder — shared across Steps 7, 8, 9, 10
             $driverStoreRoot   = "C:\Windows\System32\DriverStore\FileRepository"
             $driverStoreFolder = Get-ChildItem -Path $driverStoreRoot -Directory `
                                  -ErrorAction SilentlyContinue |
@@ -228,12 +235,20 @@ if ($result.RestartPending -eq "Yes") {
                                  Sort-Object CreationTime -Descending |
                                  Select-Object -First 1
 
+            # Pre-load INF content — reused in Steps 9 and 10
+            if ($driverStoreFolder) {
+                $infFile = Get-ChildItem -Path $driverStoreFolder.FullName `
+                           -Filter "$infBaseName.inf" -ErrorAction SilentlyContinue |
+                           Select-Object -First 1
+                if ($infFile) {
+                    $infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
+                }
+            }
+
             $result.DetectionSource += " | DriverStore-Enriched"
 
-            # FIX: Cross-validate WU history name against the actual Lenovo INF.
-            # If the resolved driver name doesn't mention Lenovo AND the INF name
-            # is a known Lenovo prefix (lnv*), the WU history matched the wrong
-            # driver (e.g. Intel). Reset so INF parsing takes over in Step 9.
+            # Cross-validate WU history name against the Lenovo INF
+            # If WU matched a non-Lenovo title and INF is a Lenovo prefix — discard WU result
             if ($result.DriverName -ne "N/A" -and
                 $result.DriverName -notmatch "(?i)lenovo" -and
                 $infBaseName -match "^lnv") {
@@ -248,9 +263,9 @@ if ($result.RestartPending -eq "Yes") {
 }
 
 # ── Step 7 : Win32_PnPSignedDriver.DeviceName — precise friendly name ─────────
-# Works for standard PnP drivers. Kernel filter drivers return empty here
-# and fall through to Step 9 INF parsing.
-if ($result.RestartPending -eq "Yes" -and $infBaseName -and $result.DriverName -eq "N/A") {
+# Works for standard PnP drivers. Kernel filter / extension drivers return
+# empty here and fall through to Steps 9 and 10.
+if ($result.RestartPending -eq "Yes" -and $infBaseName -and (NameNeedsResolution $result.DriverName)) {
     try {
         $pnpSigned = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
                      Where-Object { $_.InfName -like "$infBaseName*" } |
@@ -262,7 +277,6 @@ if ($result.RestartPending -eq "Yes" -and $infBaseName -and $result.DriverName -
         elseif ($pnpSigned -and $pnpSigned.Description -and $pnpSigned.Description -ne "") {
             $result.DriverName = $pnpSigned.Description
         }
-        # Empty = kernel filter driver — falls through to Step 9
     }
     catch {
         $result.DetectionSource += " | PnPSignedDriver-ReadError"
@@ -270,7 +284,6 @@ if ($result.RestartPending -eq "Yes" -and $infBaseName -and $result.DriverName -
 }
 
 # ── Step 8 : DriverStore folder creation date — actual WU install date ─────────
-# The FileRepository folder is created at the exact moment WU stages the driver.
 if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
     try {
         $result.DriverInstallDate = $driverStoreFolder.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
@@ -281,75 +294,57 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
     }
 }
 
-# ── Step 9 : INF file [Strings] parsing — driver name from INF itself ──────────
-# Triggered when:
-#   - DriverName is still N/A (PnP lookup failed — kernel filter driver), OR
-#   - DriverName doesn't contain "Lenovo" (WU history returned wrong vendor)
-# Reads the INF directly from the DriverStore folder.
-# Priority order: DriverDesc → ProductName → Description → Class
-$needsInfParsing = (
-    $result.RestartPending -eq "Yes" -and
-    $driverStoreFolder -and
-    $infBaseName -and
-    ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo")
-)
-
-if ($needsInfParsing) {
+# ── Step 9 : INF file [Strings] parsing — human-readable name from INF ─────────
+# Triggered when name is still unresolved or too generic (e.g. "Lenovo Extension Driver").
+# Reads DriverDesc, ProductName, Description, Class from the INF file.
+if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
     try {
-        $infFile = Get-ChildItem -Path $driverStoreFolder.FullName `
-                   -Filter "$infBaseName.inf" -ErrorAction SilentlyContinue |
-                   Select-Object -First 1
+        # Priority 1 — DriverDesc (most descriptive, e.g. "Lenovo Sound Filter Driver")
+        $driverDescLine = $infContent | Select-String '^\s*DriverDesc\s*=' |
+                          Select-Object -First 1
+        if ($driverDescLine) {
+            $parsed = ($driverDescLine -split '=', 2)[-1].Trim().Trim('"')
+            if ($parsed -ne "") {
+                $result.DriverName      = $parsed
+                $result.DetectionSource += " | INF-DriverDesc"
+            }
+        }
 
-        if ($infFile) {
-            $infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
-
-            # Priority 1 — DriverDesc in [Strings] section (most descriptive)
-            $driverDescLine = $infContent | Select-String '^\s*DriverDesc\s*=' |
-                              Select-Object -First 1
-            if ($driverDescLine) {
-                $parsed = ($driverDescLine -split '=', 2)[-1].Trim().Trim('"')
+        # Priority 2 — ProductName
+        if (NameNeedsResolution $result.DriverName) {
+            $productLine = $infContent | Select-String '^\s*ProductName\s*=' |
+                           Select-Object -First 1
+            if ($productLine) {
+                $parsed = ($productLine -split '=', 2)[-1].Trim().Trim('"')
                 if ($parsed -ne "") {
                     $result.DriverName      = $parsed
-                    $result.DetectionSource += " | INF-DriverDesc"
+                    $result.DetectionSource += " | INF-ProductName"
                 }
             }
+        }
 
-            # Priority 2 — ProductName in [Strings] section
-            if ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo") {
-                $productLine = $infContent | Select-String '^\s*ProductName\s*=' |
-                               Select-Object -First 1
-                if ($productLine) {
-                    $parsed = ($productLine -split '=', 2)[-1].Trim().Trim('"')
-                    if ($parsed -ne "") {
-                        $result.DriverName      = $parsed
-                        $result.DetectionSource += " | INF-ProductName"
-                    }
+        # Priority 3 — Description under [Version]
+        if (NameNeedsResolution $result.DriverName) {
+            $versionDesc = $infContent | Select-String '^\s*Description\s*=' |
+                           Select-Object -First 1
+            if ($versionDesc) {
+                $parsed = ($versionDesc -split '=', 2)[-1].Trim().Trim('"')
+                if ($parsed -ne "") {
+                    $result.DriverName      = $parsed
+                    $result.DetectionSource += " | INF-Description"
                 }
             }
+        }
 
-            # Priority 3 — Description under [Version] section
-            if ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo") {
-                $versionDesc = $infContent | Select-String '^\s*Description\s*=' |
-                               Select-Object -First 1
-                if ($versionDesc) {
-                    $parsed = ($versionDesc -split '=', 2)[-1].Trim().Trim('"')
-                    if ($parsed -ne "") {
-                        $result.DriverName      = $parsed
-                        $result.DetectionSource += " | INF-Description"
-                    }
-                }
-            }
-
-            # Priority 4 — Class name from [Version] as last meaningful fallback
-            if ($result.DriverName -eq "N/A" -or $result.DriverName -notmatch "(?i)lenovo") {
-                $classLine = $infContent | Select-String '^\s*ClassDesc\s*=|^\s*Class\s*=' |
-                             Select-Object -First 1
-                if ($classLine) {
-                    $parsed = ($classLine -split '=', 2)[-1].Trim().Trim('"')
-                    if ($parsed -ne "" -and $parsed -notmatch "^\{") {
-                        $result.DriverName      = "Lenovo $parsed Driver"
-                        $result.DetectionSource += " | INF-Class"
-                    }
+        # Priority 4 — Class name from [Version]
+        if (NameNeedsResolution $result.DriverName) {
+            $classLine = $infContent | Select-String '^\s*ClassDesc\s*=|^\s*Class\s*=' |
+                         Select-Object -First 1
+            if ($classLine) {
+                $parsed = ($classLine -split '=', 2)[-1].Trim().Trim('"')
+                if ($parsed -ne "" -and $parsed -notmatch "^\{") {
+                    $result.DriverName      = "Lenovo $parsed Driver"
+                    $result.DetectionSource += " | INF-Class"
                 }
             }
         }
@@ -357,14 +352,67 @@ if ($needsInfParsing) {
     catch {
         $result.DetectionSource += " | INF-ParseError"
     }
+}
 
-    # Absolute last resort — clean INF basename without (INF) suffix
-    if ($result.DriverName -eq "N/A") {
+# ── Step 10 : Hardware ID → PnP device name mapping ───────────────────────────
+# NEW: For INF extension drivers (e.g. lnvvsndmft.inf) that register as
+# extensions on top of a base device, the INF contains hardware IDs in the
+# [Manufacturer] or device install sections. We extract those IDs and look up
+# the matching PnP device name from Win32_PnPEntity — this gives the actual
+# device this driver extends (e.g. "Realtek(R) Audio" becomes
+# "Lenovo Audio Extension for Realtek").
+if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
+    try {
+        # Extract hardware IDs from INF device install sections
+        # Pattern matches lines like: %DevDesc% = Install_Section, HDAUDIO\FUNC_01...
+        $hwIdLines = $infContent | Select-String '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;]+' |
+                     Select-Object -First 5
+
+        if ($hwIdLines) {
+            # Load all PnP entities once for matching
+            $allPnpEntities = Get-WmiObject Win32_PnPEntity -ErrorAction SilentlyContinue
+
+            foreach ($hwIdLine in $hwIdLines) {
+                $hwIdMatch = [regex]::Match(
+                    $hwIdLine.Line,
+                    '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;"]+')
+
+                if ($hwIdMatch.Success) {
+                    $hwId = $hwIdMatch.Value.Trim()
+
+                    # Find the PnP device that owns this hardware ID
+                    $matchedDevice = $allPnpEntities | Where-Object {
+                        $_.HardwareID -contains $hwId -and
+                        $_.Name -ne $null -and
+                        $_.Name -ne ""
+                    } | Select-Object -First 1
+
+                    if ($matchedDevice) {
+                        # Build a meaningful name combining Lenovo context + device name
+                        $baseName = $matchedDevice.Name
+                        $result.DriverName = if ($baseName -match "(?i)lenovo") {
+                            $baseName
+                        } else {
+                            "Lenovo Driver Extension - $baseName"
+                        }
+                        $result.DetectionSource += " | HardwareID-PnPMatch"
+                        break
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $result.DetectionSource += " | HardwareID-LookupError"
+    }
+
+    # Absolute last resort — clean INF basename
+    if (NameNeedsResolution $result.DriverName) {
         $result.DriverName = $infBaseName
     }
 }
 
-# ── Step 10 : Output formatted report ─────────────────────────────────────────
+# ── Step 11 : Output formatted report ─────────────────────────────────────────
 Write-Output ""
 Write-Output "========================================"
 Write-Output " Lenovo Driver Reboot Detection Report"
@@ -387,8 +435,7 @@ else {
 Write-Output "========================================"
 Write-Output ""
 
-# ── Step 11 : Nexthink Remote Action output variables ─────────────────────────
-# Register these as output variables in the Nexthink Remote Action definition
+# ── Step 12 : Nexthink Remote Action output variables ─────────────────────────
 Write-Output "NXT_RestartPending=$($result.RestartPending)"
 Write-Output "NXT_DriverName=$($result.DriverName)"
 Write-Output "NXT_DriverVersion=$($result.DriverVersion)"
