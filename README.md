@@ -22,7 +22,7 @@ $result = [PSCustomObject]@{
     DriverVersion     = "N/A"
     DriverBuiltDate   = "N/A"   # Date Lenovo authored/signed the driver package
     DriverInstallDate = "N/A"   # Date WU staged the driver on this device
-    RebootFlagDate    = "N/A"   # Date WU actually set the reboot pending flag
+    RebootFlagDate    = "N/A"   # Date reboot pending flag was set
     DaysPending       = "N/A"   # How many days the reboot has been outstanding
     DetectionSource   = "N/A"
 }
@@ -39,25 +39,54 @@ function NameNeedsResolution {
 }
 
 # ── Helper : Parse a named key from INF content, resolving %Token% refs ───────
+# FIX: keyPattern is now regex-escaped to prevent special characters from
+# breaking the Select-String pattern match.
 function Get-InfValue {
     param(
         [string[]] $infContent,
         [string]   $keyPattern
     )
-    $line = $infContent | Select-String "^\s*$keyPattern\s*=" | Select-Object -First 1
-    if (-not $line) { return $null }
+    try {
+        $escapedKey = [regex]::Escape($keyPattern)
+        $line = $infContent | Select-String "^\s*$escapedKey\s*=" | Select-Object -First 1
+        if (-not $line) { return $null }
 
-    $raw = ($line -split '=', 2)[-1].Trim().Trim('"')
+        $raw = ($line -split '=', 2)[-1].Trim().Trim('"')
 
-    # Resolve %Token% references from the [Strings] section
-    if ($raw -match '^%(.+)%$') {
-        $token     = $Matches[1]
-        $tokenLine = $infContent | Select-String "^\s*$token\s*=" | Select-Object -First 1
-        if ($tokenLine) {
-            $raw = ($tokenLine -split '=', 2)[-1].Trim().Trim('"')
+        # Resolve %Token% references from the [Strings] section
+        if ($raw -match '^%(.+)%$') {
+            $token          = [regex]::Escape($Matches[1])
+            $tokenLine      = $infContent | Select-String "^\s*$token\s*=" | Select-Object -First 1
+            if ($tokenLine) {
+                $raw = ($tokenLine -split '=', 2)[-1].Trim().Trim('"')
+            }
+        }
+        return if ($raw -ne "") { $raw } else { $null }
+    }
+    catch {
+        return $null
+    }
+}
+
+# ── Helper : Set RebootFlagDate and DaysPending from a registry key ───────────
+function Set-RebootFlagFromKey {
+    param(
+        [string] $keyPath,
+        [ref]    $resultObj
+    )
+    try {
+        $regKey = Get-Item $keyPath -ErrorAction SilentlyContinue
+        if ($regKey -and $regKey.LastWriteTime) {
+            $flagDateTime                  = $regKey.LastWriteTime
+            $resultObj.Value.RebootFlagDate = $flagDateTime.ToString("yyyy-MM-dd HH:mm:ss")
+            $resultObj.Value.DaysPending    = [math]::Round(
+                                                 ((Get-Date) - $flagDateTime).TotalDays, 0
+                                             ).ToString()
+            return $true
         }
     }
-    return if ($raw -ne "") { $raw } else { $null }
+    catch {}
+    return $false
 }
 
 # ── Step 1 : Confirm this is a Lenovo device ─────────────────────────────────
@@ -89,44 +118,34 @@ catch {
 }
 
 # ── Step 2 : Check WU RebootRequired registry key (primary reboot signal) ─────
-# Created exclusively by Windows Update when a WUfB driver needs a restart.
-# LastWriteTime of this key = exact moment WU set the reboot pending flag.
+# Created by Windows Update when a WUfB driver needs a restart.
+# LastWriteTime = exact moment WU set the reboot pending flag.
 $wuRebootKey     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
 $wuRebootPending = Test-Path $wuRebootKey
 
 if ($wuRebootPending) {
     $result.RestartPending  = "Yes"
     $result.DetectionSource = "WU-RebootRequired-Registry"
-
-    # Capture when the reboot flag was set and how long it has been pending
-    try {
-        $wuKeyItem = Get-Item $wuRebootKey -ErrorAction SilentlyContinue
-        if ($wuKeyItem -and $wuKeyItem.LastWriteTime) {
-            $rebootFlagDateTime    = $wuKeyItem.LastWriteTime
-            $result.RebootFlagDate = $rebootFlagDateTime.ToString("yyyy-MM-dd HH:mm:ss")
-            $result.DaysPending    = [math]::Round(
-                                         ((Get-Date) - $rebootFlagDateTime).TotalDays, 0
-                                     ).ToString()
-        }
-    }
-    catch {
-        $result.DetectionSource += " | RebootFlagDate-ReadError"
-    }
+    Set-RebootFlagFromKey -keyPath $wuRebootKey -resultObj ([ref]$result) | Out-Null
 }
 
 # ── Step 3 : Secondary registry reboot signals ────────────────────────────────
 $rebootSources = @()
 
-$cbs = Get-ItemProperty `
-       "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing" `
-       -ErrorAction SilentlyContinue
+# CBS — driver INF processing pending reboot
+$cbsKeyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+$cbs        = Get-ItemProperty $cbsKeyPath -ErrorAction SilentlyContinue
 if ($cbs.RebootPending) { $rebootSources += "CBS-RebootPending" }
 
-$sm = Get-ItemProperty `
-      "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
-      -ErrorAction SilentlyContinue
+# Session Manager — driver file replacement queued until next boot
+# FIX: When WU RebootRequired key is absent, use Session Manager LastWriteTime
+# as the RebootFlagDate — this key is stamped when PendingFileRenameOperations
+# is written, i.e. when the driver file lock was queued.
+$smKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
+$sm        = Get-ItemProperty $smKeyPath -ErrorAction SilentlyContinue
 if ($sm.PendingFileRenameOperations) { $rebootSources += "PendingFileRenameOperations" }
 
+# Windows Update secondary reboot flag
 $wuReboot2 = Get-ItemProperty `
              "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" `
              -ErrorAction SilentlyContinue
@@ -140,21 +159,14 @@ if ($rebootSources.Count -gt 0) {
         $result.DetectionSource += " | " + ($rebootSources -join " | ")
     }
 
-    # If WU key wasn't present but secondary signals are — estimate from CBS key
+    # RebootFlagDate fallback chain when WU key was absent:
+    # 1st choice — Session Manager (most accurate for PendingFileRenameOperations)
+    # 2nd choice — CBS key
     if ($result.RebootFlagDate -eq "N/A") {
-        try {
-            $cbsKey = Get-Item `
-                      "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing" `
-                      -ErrorAction SilentlyContinue
-            if ($cbsKey -and $cbsKey.LastWriteTime) {
-                $rebootFlagDateTime    = $cbsKey.LastWriteTime
-                $result.RebootFlagDate = $rebootFlagDateTime.ToString("yyyy-MM-dd HH:mm:ss")
-                $result.DaysPending    = [math]::Round(
-                                             ((Get-Date) - $rebootFlagDateTime).TotalDays, 0
-                                         ).ToString()
-            }
+        $set = Set-RebootFlagFromKey -keyPath $smKeyPath -resultObj ([ref]$result)
+        if (-not $set) {
+            Set-RebootFlagFromKey -keyPath $cbsKeyPath -resultObj ([ref]$result) | Out-Null
         }
-        catch {}
     }
 }
 
@@ -325,62 +337,60 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
 #   P4 ProductName               → product name string
 #   P5 Description               → [Version] section description
 #   P6 Class                     → constructs "Lenovo <Class> Driver"
+# FIX: Get-InfValue now uses regex-escaped keys and wraps in try/catch
+# so a bad INF line no longer causes INF-ParseError for the whole step.
 if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
-    try {
-        # Priority 1 — ServiceDescription
-        $parsed = Get-InfValue -infContent $infContent -keyPattern "ServiceDescription"
+
+    # Priority 1 — ServiceDescription
+    $parsed = Get-InfValue -infContent $infContent -keyPattern "ServiceDescription"
+    if ($parsed) {
+        $result.DriverName      = $parsed
+        $result.DetectionSource += " | INF-ServiceDescription"
+    }
+
+    # Priority 2 — InstallServiceDescription
+    if (NameNeedsResolution $result.DriverName) {
+        $parsed = Get-InfValue -infContent $infContent -keyPattern "InstallServiceDescription"
         if ($parsed) {
             $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-ServiceDescription"
-        }
-
-        # Priority 2 — InstallServiceDescription
-        if (NameNeedsResolution $result.DriverName) {
-            $parsed = Get-InfValue -infContent $infContent -keyPattern "InstallServiceDescription"
-            if ($parsed) {
-                $result.DriverName      = $parsed
-                $result.DetectionSource += " | INF-InstallServiceDescription"
-            }
-        }
-
-        # Priority 3 — DriverDesc
-        if (NameNeedsResolution $result.DriverName) {
-            $parsed = Get-InfValue -infContent $infContent -keyPattern "DriverDesc"
-            if ($parsed) {
-                $result.DriverName      = $parsed
-                $result.DetectionSource += " | INF-DriverDesc"
-            }
-        }
-
-        # Priority 4 — ProductName
-        if (NameNeedsResolution $result.DriverName) {
-            $parsed = Get-InfValue -infContent $infContent -keyPattern "ProductName"
-            if ($parsed) {
-                $result.DriverName      = $parsed
-                $result.DetectionSource += " | INF-ProductName"
-            }
-        }
-
-        # Priority 5 — Description
-        if (NameNeedsResolution $result.DriverName) {
-            $parsed = Get-InfValue -infContent $infContent -keyPattern "Description"
-            if ($parsed -and $parsed -notmatch "^%") {
-                $result.DriverName      = $parsed
-                $result.DetectionSource += " | INF-Description"
-            }
-        }
-
-        # Priority 6 — Class (skip "Extension" as it's too generic)
-        if (NameNeedsResolution $result.DriverName) {
-            $parsed = Get-InfValue -infContent $infContent -keyPattern "Class"
-            if ($parsed -and $parsed -notmatch "^\{" -and $parsed -notmatch "(?i)^extension$") {
-                $result.DriverName      = "Lenovo $parsed Driver"
-                $result.DetectionSource += " | INF-Class"
-            }
+            $result.DetectionSource += " | INF-InstallServiceDescription"
         }
     }
-    catch {
-        $result.DetectionSource += " | INF-ParseError"
+
+    # Priority 3 — DriverDesc
+    if (NameNeedsResolution $result.DriverName) {
+        $parsed = Get-InfValue -infContent $infContent -keyPattern "DriverDesc"
+        if ($parsed) {
+            $result.DriverName      = $parsed
+            $result.DetectionSource += " | INF-DriverDesc"
+        }
+    }
+
+    # Priority 4 — ProductName
+    if (NameNeedsResolution $result.DriverName) {
+        $parsed = Get-InfValue -infContent $infContent -keyPattern "ProductName"
+        if ($parsed) {
+            $result.DriverName      = $parsed
+            $result.DetectionSource += " | INF-ProductName"
+        }
+    }
+
+    # Priority 5 — Description
+    if (NameNeedsResolution $result.DriverName) {
+        $parsed = Get-InfValue -infContent $infContent -keyPattern "Description"
+        if ($parsed -and $parsed -notmatch "^%") {
+            $result.DriverName      = $parsed
+            $result.DetectionSource += " | INF-Description"
+        }
+    }
+
+    # Priority 6 — Class (skip "Extension" as it's too generic)
+    if (NameNeedsResolution $result.DriverName) {
+        $parsed = Get-InfValue -infContent $infContent -keyPattern "Class"
+        if ($parsed -and $parsed -notmatch "^\{" -and $parsed -notmatch "(?i)^extension$") {
+            $result.DriverName      = "Lenovo $parsed Driver"
+            $result.DetectionSource += " | INF-Class"
+        }
     }
 }
 
@@ -443,7 +453,7 @@ if ($result.RestartPending -eq "Yes") {
     Write-Output "Driver Version      : $($result.DriverVersion)"
     Write-Output "Driver Built Date   : $($result.DriverBuiltDate)  (date Lenovo signed the driver)"
     Write-Output "Driver Install Date : $($result.DriverInstallDate)  (date WU staged it on this device)"
-    Write-Output "Reboot Flag Date    : $($result.RebootFlagDate)  (date WU set the reboot pending flag)"
+    Write-Output "Reboot Flag Date    : $($result.RebootFlagDate)  (date reboot pending flag was set)"
     Write-Output "Days Pending        : $($result.DaysPending) day(s)"
     Write-Output "Detection Source    : $($result.DetectionSource)"
 } else {
@@ -454,7 +464,6 @@ Write-Output "========================================"
 Write-Output ""
 
 # ── Step 12 : Nexthink Remote Action output variables ─────────────────────────
-# Register these as output variables in the Nexthink Remote Action definition
 Write-Output "NXT_RestartPending=$($result.RestartPending)"
 Write-Output "NXT_DriverName=$($result.DriverName)"
 Write-Output "NXT_DriverVersion=$($result.DriverVersion)"
