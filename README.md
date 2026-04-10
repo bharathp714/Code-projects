@@ -465,5 +465,26 @@ Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
 
 # ── Exit codes for Intune Proactive Remediation ────────────────────────────────
 # Exit 1 = Restart pending (non-compliant — triggers remediation action)
+
 # Exit 0 = No restart pending (compliant)
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
+
+$infBaseName = "lnvvsndmft"
+
+$driverStoreRoot = "C:\Windows\System32\DriverStore\FileRepository"
+$folder = Get-ChildItem $driverStoreRoot -Directory | 
+          Where-Object { $_.Name -like "$infBaseName*" } | 
+          Sort-Object CreationTime -Descending | Select-Object -First 1
+Write-Output "Folder found: $($folder.FullName)"
+
+$infFile = Get-ChildItem $folder.FullName | 
+           Where-Object { $_.Name -like "$infBaseName.inf" } | 
+           Select-Object -First 1
+Write-Output "INF found: $($infFile.FullName)"
+
+$infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
+Write-Output "Content type: $($infContent.GetType().Name)"
+Write-Output "Content count: $($infContent.Count)"
+
+$match = $infContent | Select-String "^\s*ServiceDescription\s*="
+Write-Output "ServiceDescription match: $($match)"
