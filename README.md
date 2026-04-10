@@ -334,12 +334,15 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
 }
 
 # ── Step 9 : INF file [Strings] parsing ───────────────────────────────────────
-# FIX: Get-InfValue now handles both INF value formats:
-#   ServiceDescription = %Token%              ← token reference (resolved)
-#   ServiceDescription="Lenovo Vision Service" ← inline quoted (parsed directly)
-# Confirmed present in LnvVsnDmft.inf:
-#   ServiceDescription="Lenovo Vision Service"
-#   InstallServiceDescription="Lenovo View Install Service"
+# Debug: surface exactly what the script sees at this point
+$dbgInfNull    = ($null -eq $infContent)
+$dbgInfCount   = if ($infContent) { $infContent.Count } else { 0 }
+$dbgNameNeedsR = NameNeedsResolution $result.DriverName
+$dbgSvcMatch   = if ($infContent) {
+    ($infContent | Select-String "ServiceDescription").Count
+} else { -1 }
+$result.DetectionSource += " | DBG:infNull=$dbgInfNull,lines=$dbgInfCount,nameNeedsR=$dbgNameNeedsR,svcMatch=$dbgSvcMatch"
+
 if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
 
     # Priority 1 — ServiceDescription → "Lenovo Vision Service"
