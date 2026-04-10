@@ -11,7 +11,9 @@
 
     Lightweight script (no external modules) that:
     - Reads device name from environment variables
-    - Lists drivers with recent Win32_PnPSignedDriver DriverDate values (default window 7 days)
+    - Lists recent driver-related activity in the window (default 7 days): Win32_PnPSignedDriver catalog dates
+      plus Windows Update Client Operational log (Event ID 19) for successful installs whose title matches
+      driver/firmware heuristics (addresses Intune/WU installs where package DriverDate is older than the window)
     - Detects pending reboot via specified registry locations
     - Computes time since last boot from Win32_OperatingSystem
     - Emits a single JSON string suitable for Nexthink structured output
@@ -54,6 +56,92 @@ function ConvertTo-DateTimeFromWmi {
 }
 #endregion
 
+#region Supplement: Windows Update Client successful installs (Event ID 19)
+# Win32_PnPSignedDriver.DriverDate is the *package/catalog* date, not when WU applied the update. Intune-approved
+# drivers often install with an older DriverDate, so the WMI-only window can be empty. Operational log 19 records
+# actual successful installs with the update title.
+function Get-RecentWuDriverLikeSuccessEvents {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$RecentDays,
+        [Parameter(Mandatory = $true)]
+        [datetime]$CutoffUtc,
+        [int]$MaxEvents = 2000
+    )
+    $rows = New-Object System.Collections.Generic.List[hashtable]
+    if ($RecentDays -le 0) { return $rows }
+
+    $startTime = (Get-Date).AddDays(-$RecentDays)
+    try {
+        $evts = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Microsoft-Windows-WindowsUpdateClient/Operational'
+            Id        = 19
+            StartTime = $startTime
+        } -MaxEvents $MaxEvents -ErrorAction Stop
+    }
+    catch {
+        return $rows
+    }
+
+    # De-dupe by update title (case-insensitive); keep newest event per title.
+    $bestByTitle = @{}
+
+    foreach ($e in $evts) {
+        $title = $null
+        try {
+            $xml = [xml]$e.ToXml()
+            # EventData may contain one or many <Data> nodes; normalize to an array for PowerShell 5.1.
+            $dataNodes = @()
+            if ($null -ne $xml.Event.EventData -and $null -ne $xml.Event.EventData.Data) {
+                $dataNodes = @($xml.Event.EventData.Data)
+            }
+            $node = $dataNodes | Where-Object { $_.Name -eq 'updateTitle' } | Select-Object -First 1
+            if ($null -ne $node) { $title = [string]$node.'#text' }
+        }
+        catch { }
+
+        if ([string]::IsNullOrWhiteSpace($title) -and $null -ne $e.Message) {
+            if ($e.Message -match '(?i)the following update:\s*(.+)$') {
+                $title = $matches[1].Trim()
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($title)) { continue }
+
+        # Heuristic: driver/firmware-class updates (tune for your catalog if needed).
+        if ($title -notmatch '(?i)\bdriver\b|firmware|\bchipset\b|\bbios\b|\buefi\b|realtek|nvidia|geforce|radeon|\bamd\b|intel\(|qualcomm|mediatek|broadcom|marvell|synaptics|elan|touchpad|bluetooth|wireless|wlan|wi-?fi|network adapter|audio|sound|camera|fingerprint|display adapter|graphics|monitor|panel|sensor|trackpoint|lenovo system|\blenovo\b|thinkpad|thinkbook|hp firmware|dell firmware|surface firmware') {
+            continue
+        }
+
+        $utc = $e.TimeCreated.ToUniversalTime()
+        if ($utc -lt $CutoffUtc) { continue }
+
+        $key = $title.ToLowerInvariant()
+        if (-not $bestByTitle.ContainsKey($key) -or $utc -gt $bestByTitle[$key].TimeUtc) {
+            $bestByTitle[$key] = [PSCustomObject]@{ TimeUtc = $utc; Title = $title; EventId = $e.Id }
+        }
+    }
+
+    foreach ($k in $bestByTitle.Keys) {
+        $rec = $bestByTitle[$k]
+        $ver = 'Unknown'
+        if ($rec.Title -match '\(([0-9][0-9.\s]*)\)') {
+            $ver = $matches[1].Trim()
+        }
+
+        $rows.Add(@{
+            DriverName            = $rec.Title
+            DriverVersion         = $ver
+            DriverInstallDate     = $rec.TimeUtc.ToString('o')
+            Manufacturer          = $null
+            DriverDetectionSource = 'WindowsUpdateClient_Event19_InstallSuccess'
+            WindowsUpdateEventId  = $rec.EventId
+        })
+    }
+
+    return $rows
+}
+#endregion
+
 #region Device name from environment (per requirement)
 $deviceName = $env:COMPUTERNAME
 if ([string]::IsNullOrWhiteSpace($deviceName)) {
@@ -68,23 +156,56 @@ $timeSinceLastRebootDays = $null
 $timeSinceLastRebootDisplay = 'Unknown'
 $lastBootUpTimeIso = $null
 
+function Get-LastBootUpTimeUtc {
+    # Prefer legacy WMI (Get-WmiObject): LastBootUpTime is a DMTF string — avoids CIM DateTime Kind quirks on some builds.
+    $lastBootLocal = $null
+    try {
+        $wmiOs = Get-WmiObject -Class Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop
+        if ($null -ne $wmiOs -and $null -ne $wmiOs.LastBootUpTime) {
+            $lastBootLocal = ConvertTo-DateTimeFromWmi -InputObject $wmiOs.LastBootUpTime
+        }
+    }
+    catch {
+        $lastBootLocal = $null
+    }
+    if ($null -eq $lastBootLocal) {
+        try {
+            $os = Get-CimInstance -Namespace root\cimv2 -ClassName Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop
+            if ($null -ne $os -and $null -ne $os.LastBootUpTime) {
+                $raw = $os.LastBootUpTime
+                if ($raw -is [datetime]) {
+                    # CIM often returns Unspecified; treat as local wall-clock boot time (Win32_OperatingSystem convention).
+                    switch ($raw.Kind) {
+                        ([DateTimeKind]::Utc) { $lastBootLocal = $raw; break }
+                        ([DateTimeKind]::Local) { $lastBootLocal = $raw; break }
+                        Default { $lastBootLocal = [DateTime]::SpecifyKind($raw, [DateTimeKind]::Local); break }
+                    }
+                }
+                else {
+                    $lastBootLocal = ConvertTo-DateTimeFromWmi -InputObject $raw
+                }
+            }
+        }
+        catch {
+            return $null
+        }
+    }
+    if ($null -eq $lastBootLocal) { return $null }
+    return $lastBootLocal.ToUniversalTime()
+}
+
 try {
-    $os = Get-CimInstance -Namespace root\cimv2 -ClassName Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop
-    if ($null -ne $os -and $null -ne $os.LastBootUpTime) {
-        $lastBootLocal = ConvertTo-DateTimeFromWmi -InputObject $os.LastBootUpTime
-        if ($null -ne $lastBootLocal) {
-            $lastBootUtc = $lastBootLocal.ToUniversalTime()
-            $lastBootUpTimeIso = $lastBootUtc.ToString('o')
-            # Compare in UTC so DST / locale do not skew uptime math.
-            $span = (Get-Date).ToUniversalTime() - $lastBootUtc
-            $timeSinceLastRebootHours = [math]::Round($span.TotalHours, 2)
-            $timeSinceLastRebootDays = [math]::Round($span.TotalDays, 2)
-            if ($span.TotalDays -ge 1) {
-                $timeSinceLastRebootDisplay = ('{0} days ({1:F2} hours)' -f [int][math]::Floor($span.TotalDays), $span.TotalHours)
-            }
-            else {
-                $timeSinceLastRebootDisplay = ('{0:F2} hours' -f $span.TotalHours)
-            }
+    $lastBootUtc = Get-LastBootUpTimeUtc
+    if ($null -ne $lastBootUtc) {
+        $lastBootUpTimeIso = $lastBootUtc.ToString('o')
+        $span = [datetime]::UtcNow - $lastBootUtc
+        $timeSinceLastRebootHours = [math]::Round($span.TotalHours, 2)
+        $timeSinceLastRebootDays = [math]::Round($span.TotalDays, 2)
+        if ($span.TotalDays -ge 1) {
+            $timeSinceLastRebootDisplay = ('{0} days ({1:F2} hours)' -f [int][math]::Floor($span.TotalDays), $span.TotalHours)
+        }
+        else {
+            $timeSinceLastRebootDisplay = ('{0:F2} hours' -f $span.TotalHours)
         }
     }
 }
@@ -217,11 +338,25 @@ foreach ($d in $allDrivers) {
     if ([string]::IsNullOrWhiteSpace($ver)) { $ver = 'Unknown' }
 
     $driverRows.Add(@{
-        DriverName        = $name
-        DriverVersion     = $ver
-        DriverInstallDate = $dtUtc.ToString('o')
-        Manufacturer      = if ([string]::IsNullOrWhiteSpace($d.Manufacturer)) { $null } else { $d.Manufacturer }
+        DriverName            = $name
+        DriverVersion         = $ver
+        DriverInstallDate     = $dtUtc.ToString('o')
+        Manufacturer          = if ([string]::IsNullOrWhiteSpace($d.Manufacturer)) { $null } else { $d.Manufacturer }
+        DriverDetectionSource = 'PnPSignedDriver_DriverDate'
+        WindowsUpdateEventId  = $null
     })
+}
+
+# Add WU operational successes in the same window (install time, not INF package date).
+try {
+    if ($RecentDays -gt 0 -and $null -ne $cutoffUtc) {
+        foreach ($wuRow in (Get-RecentWuDriverLikeSuccessEvents -RecentDays $RecentDays -CutoffUtc $cutoffUtc)) {
+            $driverRows.Add($wuRow)
+        }
+    }
+}
+catch {
+    # Log may be unavailable; continue with WMI-only results.
 }
 
 # Most recent first (clear ordering when multiple drivers match). @() ensures a single row stays an array (hashtable.Count is ambiguous).
@@ -246,7 +381,7 @@ if ($sorted.Count -gt 0) {
 $result = [ordered]@{
     DeviceName                          = $deviceName
     # Fixed string so Nexthink parsers and reports can document scope: Intune approves in cloud; WU installs; WMI lists drivers.
-    IntuneDriverUpdatePolicyContext     = 'Drivers are approved/deployed via Intune Windows driver update policies (Manage driver updates); Windows Update installs drivers locally. This output is on-device inventory (WMI) only, not Intune service data.'
+    IntuneDriverUpdatePolicyContext     = 'Drivers are approved/deployed via Intune Windows driver update policies (Manage driver updates); Windows Update installs locally. Recent rows combine Win32_PnPSignedDriver catalog dates with Windows Update Client Operational Event 19 install successes (title heuristics for driver/firmware-class updates). Not Intune Graph/admin-center data.'
     RebootPending                       = $rebootPendingText
     RebootPendingReasons                = @($rebootInfo.Reasons)
     TimeSinceLastRebootHours            = $timeSinceLastRebootHours
