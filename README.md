@@ -51,24 +51,28 @@ function Get-InfValue {
     try {
         $escapedKey = [regex]::Escape($keyPattern)
 
-        # Match key regardless of spacing or quoting style around =
+        # Pattern stops at = with no trailing \s* so the quote character
+        # immediately after = is preserved for value extraction below.
         $line = $infContent |
-                Select-String "^\s*$escapedKey\s*=\s*" |
+                Select-String "^\s*$escapedKey\s*=" |
                 Select-Object -First 1
 
         if (-not $line) { return $null }
 
-        # Extract everything after the first = and strip surrounding quotes
-        $raw = ($line.Line -split '=', 2)[-1].Trim().Trim('"')
+        # Split on first = only, then strip whitespace and all quote styles.
+        # Handles both formats:
+        #   ServiceDescription = %Token%
+        #   ServiceDescription="Lenovo Vision Service"
+        $raw = ($line.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
 
         # If value is a %Token% reference, resolve it from the [Strings] section
         if ($raw -match '^%(.+)%$') {
             $token     = [regex]::Escape($Matches[1])
             $tokenLine = $infContent |
-                         Select-String "^\s*$token\s*=\s*" |
+                         Select-String "^\s*$token\s*=" |
                          Select-Object -First 1
             if ($tokenLine) {
-                $raw = ($tokenLine.Line -split '=', 2)[-1].Trim().Trim('"')
+                $raw = ($tokenLine.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
             }
         }
 
@@ -334,15 +338,6 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
 }
 
 # ── Step 9 : INF file [Strings] parsing ───────────────────────────────────────
-# Debug: surface exactly what the script sees at this point
-$dbgInfNull    = ($null -eq $infContent)
-$dbgInfCount   = if ($infContent) { $infContent.Count } else { 0 }
-$dbgNameNeedsR = NameNeedsResolution $result.DriverName
-$dbgSvcMatch   = if ($infContent) {
-    ($infContent | Select-String "ServiceDescription").Count
-} else { -1 }
-$result.DetectionSource += " | DBG:infNull=$dbgInfNull,lines=$dbgInfCount,nameNeedsR=$dbgNameNeedsR,svcMatch=$dbgSvcMatch"
-
 if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
 
     # Priority 1 — ServiceDescription → "Lenovo Vision Service"
