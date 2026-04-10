@@ -288,16 +288,26 @@ if ($result.RestartPending -eq "Yes") {
 }
 
 # ── Step 7 : Win32_PnPSignedDriver.DeviceName ────────────────────────────────
+# Only accept the resolved name if it contains "Lenovo" — otherwise leave
+# DriverName as-is so Step 9 INF parsing gets a chance to run.
+# Win32_PnPSignedDriver sometimes returns generic or unrelated names for
+# extension/filter drivers which would incorrectly satisfy NameNeedsResolution.
 if ($result.RestartPending -eq "Yes" -and $infBaseName -and (NameNeedsResolution $result.DriverName)) {
     try {
         $pnpSigned = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
                      Where-Object { $_.InfName -like "$infBaseName*" } | Select-Object -First 1
 
-        if ($pnpSigned -and $pnpSigned.DeviceName -and $pnpSigned.DeviceName -ne "") {
+        if ($pnpSigned -and $pnpSigned.DeviceName -and
+            $pnpSigned.DeviceName -ne "" -and
+            $pnpSigned.DeviceName -match "(?i)lenovo") {
             $result.DriverName = $pnpSigned.DeviceName
-        } elseif ($pnpSigned -and $pnpSigned.Description -and $pnpSigned.Description -ne "") {
+        } elseif ($pnpSigned -and $pnpSigned.Description -and
+                  $pnpSigned.Description -ne "" -and
+                  $pnpSigned.Description -match "(?i)lenovo") {
             $result.DriverName = $pnpSigned.Description
         }
+        # If neither contains "Lenovo" — leave DriverName unchanged
+        # so Step 9 INF parsing runs next
     }
     catch { $result.DetectionSource += " | PnPSignedDriver-ReadError" }
 }
@@ -465,26 +475,5 @@ Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
 
 # ── Exit codes for Intune Proactive Remediation ────────────────────────────────
 # Exit 1 = Restart pending (non-compliant — triggers remediation action)
-
 # Exit 0 = No restart pending (compliant)
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
-
-$infBaseName = "lnvvsndmft"
-
-$driverStoreRoot = "C:\Windows\System32\DriverStore\FileRepository"
-$folder = Get-ChildItem $driverStoreRoot -Directory | 
-          Where-Object { $_.Name -like "$infBaseName*" } | 
-          Sort-Object CreationTime -Descending | Select-Object -First 1
-Write-Output "Folder found: $($folder.FullName)"
-
-$infFile = Get-ChildItem $folder.FullName | 
-           Where-Object { $_.Name -like "$infBaseName.inf" } | 
-           Select-Object -First 1
-Write-Output "INF found: $($infFile.FullName)"
-
-$infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
-Write-Output "Content type: $($infContent.GetType().Name)"
-Write-Output "Content count: $($infContent.Count)"
-
-$match = $infContent | Select-String "^\s*ServiceDescription\s*="
-Write-Output "ServiceDescription match: $($match)"
