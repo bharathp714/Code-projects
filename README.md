@@ -38,7 +38,11 @@ function NameNeedsResolution {
     )
 }
 
-# ── Helper : Parse a named key from INF content, resolving %Token% refs ───────
+# ── Helper : Parse a named key from INF content ───────────────────────────────
+# FIX: Now handles both INF value formats:
+#   Format A — token reference : ServiceDescription = %ServiceDescription%
+#   Format B — inline quoted   : ServiceDescription="Lenovo Vision Service"
+# Both are common in Lenovo INF files. Previously only Format A was handled.
 function Get-InfValue {
     param(
         [string[]] $infContent,
@@ -46,27 +50,34 @@ function Get-InfValue {
     )
     try {
         $escapedKey = [regex]::Escape($keyPattern)
-        $line       = $infContent | Select-String "^\s*$escapedKey\s*=" |
-                      Select-Object -First 1
+
+        # Match key regardless of spacing or quoting style around =
+        $line = $infContent |
+                Select-String "^\s*$escapedKey\s*=\s*" |
+                Select-Object -First 1
+
         if (-not $line) { return $null }
 
-        $raw = ($line -split '=', 2)[-1].Trim().Trim('"')
+        # Extract everything after the first = and strip surrounding quotes
+        $raw = ($line.Line -split '=', 2)[-1].Trim().Trim('"')
 
-        # Resolve %Token% references from the [Strings] section
+        # If value is a %Token% reference, resolve it from the [Strings] section
         if ($raw -match '^%(.+)%$') {
             $token     = [regex]::Escape($Matches[1])
-            $tokenLine = $infContent | Select-String "^\s*$token\s*=" |
+            $tokenLine = $infContent |
+                         Select-String "^\s*$token\s*=\s*" |
                          Select-Object -First 1
             if ($tokenLine) {
-                $raw = ($tokenLine -split '=', 2)[-1].Trim().Trim('"')
+                $raw = ($tokenLine.Line -split '=', 2)[-1].Trim().Trim('"')
             }
         }
-        return if ($raw -ne "") { $raw } else { $null }
+
+        return if ($raw -ne "" -and $raw -notmatch "^%") { $raw } else { $null }
     }
     catch { return $null }
 }
 
-# ── Helper : Set DaysPending from a DateTime ──────────────────────────────────
+# ── Helper : Calculate DaysPending from a DateTime ────────────────────────────
 function Set-DaysPending {
     param([datetime]$flagDateTime, [ref]$resultObj)
     $resultObj.Value.RebootFlagDate = $flagDateTime.ToString("yyyy-MM-dd HH:mm:ss")
@@ -245,9 +256,8 @@ if ($result.RestartPending -eq "Yes") {
                                  Where-Object { $_.Name -like "$infBaseName*" } |
                                  Sort-Object CreationTime -Descending | Select-Object -First 1
 
-            # FIX: Case-insensitive INF file lookup using Where-Object instead of
-            # -Filter which is case-sensitive on some systems.
-            # Confirmed: actual filename on disk is "LnvVsnDmft.inf" not "lnvvsndmft.inf"
+            # Case-insensitive INF file lookup — confirmed filename on disk is
+            # mixed case "LnvVsnDmft.inf" vs lowercase infBaseName "lnvvsndmft"
             if ($driverStoreFolder) {
                 $infFile = Get-ChildItem -Path $driverStoreFolder.FullName `
                            -ErrorAction SilentlyContinue |
@@ -255,7 +265,9 @@ if ($result.RestartPending -eq "Yes") {
                            Select-Object -First 1
 
                 if ($infFile) {
-                    $infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
+                    $infContent = Get-Content $infFile.FullName -Raw -ErrorAction SilentlyContinue
+                    # Split into lines for Select-String while preserving full line context
+                    $infContent = $infContent -split "`r?`n"
                 }
             }
 
@@ -270,7 +282,7 @@ if ($result.RestartPending -eq "Yes") {
             }
         }
     }
-    catch { $result.DetectionSource += " | DriverStore-ReadError" }
+    catch { $result.DetectionSource += " | DriverStore-ReadError: $($_.Exception.Message)" }
 }
 
 # ── Step 7 : Win32_PnPSignedDriver.DeviceName ────────────────────────────────
@@ -291,30 +303,41 @@ if ($result.RestartPending -eq "Yes" -and $infBaseName -and (NameNeedsResolution
 # ── Step 8 : DriverStore folder creation date — actual WU install date ─────────
 if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
     try {
-        $result.DriverInstallDate = $driverStoreFolder.CreationTime.ToString("yyyy-MM-dd HH:mm:ss")
+        $folderCreationTime       = $driverStoreFolder.CreationTime
+        $result.DriverInstallDate = $folderCreationTime.ToString("yyyy-MM-dd HH:mm:ss")
         $result.DetectionSource  += " | DriverStore-FolderDate"
+
+        # FIX: Directly set RebootFlagDate from DriverStore folder CreationTime here
+        # since Session Manager LastWriteTime is unreliable (returns blank).
+        # DriverStore CreationTime = when WU staged the driver = same event that
+        # triggered PendingFileRenameOperations. No conditional check needed —
+        # if WU key already set it in Step 2, this will simply overwrite with the
+        # same or more accurate value.
+        if ($result.RebootFlagDate -eq "N/A") {
+            Set-DaysPending -flagDateTime $folderCreationTime -resultObj ([ref]$result)
+            $result.DetectionSource += " | RebootFlagDate-DriverStoreFolder"
+        }
     }
     catch { $result.DetectionSource += " | DriverStore-FolderDate-Error" }
 }
 
 # ── Step 9 : INF file [Strings] parsing ───────────────────────────────────────
-# FIX: Now reliably triggered because $infContent is populated via
-# case-insensitive file lookup (Where-Object -like) in Step 6.
-# Priority order:
-#   P1 ServiceDescription        → "Lenovo Vision Service"       (confirmed in INF)
-#   P2 InstallServiceDescription → "Lenovo View Install Service" (confirmed in INF)
-#   P3 DriverDesc                → standard driver description
-#   P4 ProductName               → product name string
-#   P5 Description               → [Version] description
-#   P6 Class                     → constructs "Lenovo <Class> Driver"
+# FIX: Get-InfValue now handles both INF value formats:
+#   ServiceDescription = %Token%              ← token reference (resolved)
+#   ServiceDescription="Lenovo Vision Service" ← inline quoted (parsed directly)
+# Confirmed present in LnvVsnDmft.inf:
+#   ServiceDescription="Lenovo Vision Service"
+#   InstallServiceDescription="Lenovo View Install Service"
 if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
 
+    # Priority 1 — ServiceDescription → "Lenovo Vision Service"
     $parsed = Get-InfValue -infContent $infContent -keyPattern "ServiceDescription"
     if ($parsed) {
         $result.DriverName      = $parsed
         $result.DetectionSource += " | INF-ServiceDescription"
     }
 
+    # Priority 2 — InstallServiceDescription → "Lenovo View Install Service"
     if (NameNeedsResolution $result.DriverName) {
         $parsed = Get-InfValue -infContent $infContent -keyPattern "InstallServiceDescription"
         if ($parsed) {
@@ -323,6 +346,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
         }
     }
 
+    # Priority 3 — DriverDesc
     if (NameNeedsResolution $result.DriverName) {
         $parsed = Get-InfValue -infContent $infContent -keyPattern "DriverDesc"
         if ($parsed) {
@@ -331,6 +355,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
         }
     }
 
+    # Priority 4 — ProductName
     if (NameNeedsResolution $result.DriverName) {
         $parsed = Get-InfValue -infContent $infContent -keyPattern "ProductName"
         if ($parsed) {
@@ -339,6 +364,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
         }
     }
 
+    # Priority 5 — Description
     if (NameNeedsResolution $result.DriverName) {
         $parsed = Get-InfValue -infContent $infContent -keyPattern "Description"
         if ($parsed -and $parsed -notmatch "^%") {
@@ -347,6 +373,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
         }
     }
 
+    # Priority 6 — Class (skip "Extension" — too generic)
     if (NameNeedsResolution $result.DriverName) {
         $parsed = Get-InfValue -infContent $infContent -keyPattern "Class"
         if ($parsed -and $parsed -notmatch "^\{" -and $parsed -notmatch "(?i)^extension$") {
@@ -400,22 +427,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
     }
 }
 
-# ── Step 11 : RebootFlagDate fallback — DriverStore folder CreationTime ────────
-# FIX: Session Manager LastWriteTime returns blank (key is too fundamental to
-# Windows to carry a meaningful timestamp). DriverStore folder CreationTime is
-# the next best signal — it's stamped when WU staged the driver, which is the
-# same event that queued the PendingFileRenameOperations flag.
-if ($result.RestartPending -eq "Yes" -and $result.RebootFlagDate -eq "N/A") {
-    if ($driverStoreFolder) {
-        try {
-            Set-DaysPending -flagDateTime $driverStoreFolder.CreationTime -resultObj ([ref]$result)
-            $result.DetectionSource += " | RebootFlagDate-DriverStoreFolder"
-        }
-        catch {}
-    }
-}
-
-# ── Step 12 : Output formatted report ─────────────────────────────────────────
+# ── Step 11 : Output formatted report ─────────────────────────────────────────
 Write-Output ""
 Write-Output "========================================"
 Write-Output " Lenovo Driver Reboot Detection Report"
@@ -439,7 +451,7 @@ if ($result.RestartPending -eq "Yes") {
 Write-Output "========================================"
 Write-Output ""
 
-# ── Step 13 : Nexthink Remote Action output variables ─────────────────────────
+# ── Step 12 : Nexthink Remote Action output variables ─────────────────────────
 Write-Output "NXT_RestartPending=$($result.RestartPending)"
 Write-Output "NXT_DriverName=$($result.DriverName)"
 Write-Output "NXT_DriverVersion=$($result.DriverVersion)"
@@ -453,9 +465,3 @@ Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
 # Exit 1 = Restart pending (non-compliant — triggers remediation action)
 # Exit 0 = No restart pending (compliant)
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
-
-$f = Get-ChildItem "C:\Windows\System32\DriverStore\FileRepository" -Directory | 
-     Where-Object { $_.Name -like "lnvvsndmft*" } | Select-Object -First 1
-
-Get-ChildItem $f.FullName | Where-Object { $_.Name -like "lnvvsndmft.inf" } | 
-Select-Object Name, FullName
