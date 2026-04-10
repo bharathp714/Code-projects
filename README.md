@@ -28,15 +28,13 @@ $result = [PSCustomObject]@{
 }
 
 # ── Helper : Test if driver name needs further resolution ─────────────────────
-# FIX: Expanded to also catch raw INF basenames (no "lenovo" in name at all,
-# e.g. "lnvvsndmft") which were slipping through as "resolved".
 function NameNeedsResolution {
     param($name)
     return (
-        $name -eq "N/A"                        -or   # Never resolved
-        $name -notmatch "(?i)lenovo"           -or   # No Lenovo in name (incl. raw INF basename)
-        $name -match "(?i)^lenovo extension"   -or   # Generic extension class fallback
-        $name -match "(?i)^lenovo \w+ driver$"        # Generic class-derived name
+        $name -eq "N/A"                        -or
+        $name -notmatch "(?i)lenovo"           -or
+        $name -match "(?i)^lenovo extension"   -or
+        $name -match "(?i)^lenovo \w+ driver$"
     )
 }
 
@@ -48,7 +46,8 @@ function Get-InfValue {
     )
     try {
         $escapedKey = [regex]::Escape($keyPattern)
-        $line       = $infContent | Select-String "^\s*$escapedKey\s*=" | Select-Object -First 1
+        $line       = $infContent | Select-String "^\s*$escapedKey\s*=" |
+                      Select-Object -First 1
         if (-not $line) { return $null }
 
         $raw = ($line -split '=', 2)[-1].Trim().Trim('"')
@@ -56,7 +55,8 @@ function Get-InfValue {
         # Resolve %Token% references from the [Strings] section
         if ($raw -match '^%(.+)%$') {
             $token     = [regex]::Escape($Matches[1])
-            $tokenLine = $infContent | Select-String "^\s*$token\s*=" | Select-Object -First 1
+            $tokenLine = $infContent | Select-String "^\s*$token\s*=" |
+                         Select-Object -First 1
             if ($tokenLine) {
                 $raw = ($tokenLine -split '=', 2)[-1].Trim().Trim('"')
             }
@@ -66,44 +66,13 @@ function Get-InfValue {
     catch { return $null }
 }
 
-# ── Helper : Get registry key LastWriteTime via .NET interop ──────────────────
-# FIX: PowerShell's Get-Item on registry paths does not reliably expose
-# LastWriteTime. Using Microsoft.Win32.RegistryKey directly is the correct
-# approach and always returns the accurate timestamp.
-function Get-RegistryKeyLastWriteTime {
-    param([string] $hivePath)   # e.g. "SYSTEM\CurrentControlSet\Control\Session Manager"
-    try {
-        $hive   = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-                      [Microsoft.Win32.RegistryHive]::LocalMachine,
-                      [Microsoft.Win32.RegistryView]::Registry64)
-        $subKey = $hive.OpenSubKey($hivePath)
-        if ($subKey) {
-            $lwt = $subKey.LastWriteTime
-            $subKey.Close()
-            $hive.Close()
-            return $lwt
-        }
-        $hive.Close()
-    }
-    catch {}
-    return $null
-}
-
-# ── Helper : Set RebootFlagDate and DaysPending from a registry path ──────────
-function Set-RebootFlagFromKey {
-    param(
-        [string] $hivePath,
-        [ref]    $resultObj
-    )
-    $lwt = Get-RegistryKeyLastWriteTime -hivePath $hivePath
-    if ($lwt) {
-        $resultObj.Value.RebootFlagDate = $lwt.ToString("yyyy-MM-dd HH:mm:ss")
-        $resultObj.Value.DaysPending    = [math]::Round(
-                                              ((Get-Date) - $lwt).TotalDays, 0
-                                          ).ToString()
-        return $true
-    }
-    return $false
+# ── Helper : Set DaysPending from a DateTime ──────────────────────────────────
+function Set-DaysPending {
+    param([datetime]$flagDateTime, [ref]$resultObj)
+    $resultObj.Value.RebootFlagDate = $flagDateTime.ToString("yyyy-MM-dd HH:mm:ss")
+    $resultObj.Value.DaysPending    = [math]::Round(
+                                          ((Get-Date) - $flagDateTime).TotalDays, 0
+                                      ).ToString()
 }
 
 # ── Step 1 : Confirm this is a Lenovo device ─────────────────────────────────
@@ -133,25 +102,34 @@ try {
 catch { $result.Manufacturer = "Unknown" }
 
 # ── Step 2 : Check WU RebootRequired registry key (primary reboot signal) ─────
-$wuRebootHivePath = "SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-$wuRebootKey      = "HKLM:\$wuRebootHivePath"
-$wuRebootPending  = Test-Path $wuRebootKey
+$wuRebootKey     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+$wuRebootPending = Test-Path $wuRebootKey
 
 if ($wuRebootPending) {
     $result.RestartPending  = "Yes"
     $result.DetectionSource = "WU-RebootRequired-Registry"
-    Set-RebootFlagFromKey -hivePath $wuRebootHivePath -resultObj ([ref]$result) | Out-Null
+
+    try {
+        $wuKeyItem = Get-Item $wuRebootKey -ErrorAction SilentlyContinue
+        if ($wuKeyItem -and $wuKeyItem.LastWriteTime -and
+            $wuKeyItem.LastWriteTime -gt [datetime]"2000-01-01") {
+            Set-DaysPending -flagDateTime $wuKeyItem.LastWriteTime -resultObj ([ref]$result)
+        }
+    }
+    catch {}
 }
 
 # ── Step 3 : Secondary registry reboot signals ────────────────────────────────
 $rebootSources = @()
 
-$cbsHivePath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
-$cbs         = Get-ItemProperty "HKLM:\$cbsHivePath" -ErrorAction SilentlyContinue
+$cbs = Get-ItemProperty `
+       "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing" `
+       -ErrorAction SilentlyContinue
 if ($cbs.RebootPending) { $rebootSources += "CBS-RebootPending" }
 
-$smHivePath = "SYSTEM\CurrentControlSet\Control\Session Manager"
-$sm         = Get-ItemProperty "HKLM:\$smHivePath" -ErrorAction SilentlyContinue
+$sm = Get-ItemProperty `
+      "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
+      -ErrorAction SilentlyContinue
 if ($sm.PendingFileRenameOperations) { $rebootSources += "PendingFileRenameOperations" }
 
 $wuReboot2 = Get-ItemProperty `
@@ -165,16 +143,6 @@ if ($rebootSources.Count -gt 0) {
         $result.DetectionSource = $rebootSources -join " | "
     } else {
         $result.DetectionSource += " | " + ($rebootSources -join " | ")
-    }
-
-    # RebootFlagDate fallback when WU key absent:
-    # 1st — Session Manager (most accurate for PendingFileRenameOperations)
-    # 2nd — CBS key
-    if ($result.RebootFlagDate -eq "N/A") {
-        $set = Set-RebootFlagFromKey -hivePath $smHivePath -resultObj ([ref]$result)
-        if (-not $set) {
-            Set-RebootFlagFromKey -hivePath $cbsHivePath -resultObj ([ref]$result) | Out-Null
-        }
     }
 }
 
@@ -277,10 +245,15 @@ if ($result.RestartPending -eq "Yes") {
                                  Where-Object { $_.Name -like "$infBaseName*" } |
                                  Sort-Object CreationTime -Descending | Select-Object -First 1
 
+            # FIX: Case-insensitive INF file lookup using Where-Object instead of
+            # -Filter which is case-sensitive on some systems.
+            # Confirmed: actual filename on disk is "LnvVsnDmft.inf" not "lnvvsndmft.inf"
             if ($driverStoreFolder) {
                 $infFile = Get-ChildItem -Path $driverStoreFolder.FullName `
-                           -Filter "$infBaseName.inf" -ErrorAction SilentlyContinue |
+                           -ErrorAction SilentlyContinue |
+                           Where-Object { $_.Name -like "$infBaseName.inf" } |
                            Select-Object -First 1
+
                 if ($infFile) {
                     $infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
                 }
@@ -325,12 +298,12 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
 }
 
 # ── Step 9 : INF file [Strings] parsing ───────────────────────────────────────
-# Triggered when DriverName still needs resolution (including raw INF basenames
-# like "lnvvsndmft" which contain no "lenovo" — fixed in NameNeedsResolution).
+# FIX: Now reliably triggered because $infContent is populated via
+# case-insensitive file lookup (Where-Object -like) in Step 6.
 # Priority order:
-#   P1 ServiceDescription        → "Lenovo Vision Service"
-#   P2 InstallServiceDescription → "Lenovo View Install Service"
-#   P3 DriverDesc                → standard INF driver description
+#   P1 ServiceDescription        → "Lenovo Vision Service"       (confirmed in INF)
+#   P2 InstallServiceDescription → "Lenovo View Install Service" (confirmed in INF)
+#   P3 DriverDesc                → standard driver description
 #   P4 ProductName               → product name string
 #   P5 Description               → [Version] description
 #   P6 Class                     → constructs "Lenovo <Class> Driver"
@@ -386,7 +359,8 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
 # ── Step 10 : Hardware ID → PnP device name mapping ───────────────────────────
 if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
     try {
-        $hwIdLines = $infContent | Select-String '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;]+' |
+        $hwIdLines = $infContent |
+                     Select-String '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;]+' |
                      Select-Object -First 5
 
         if ($hwIdLines) {
@@ -426,7 +400,22 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
     }
 }
 
-# ── Step 11 : Output formatted report ─────────────────────────────────────────
+# ── Step 11 : RebootFlagDate fallback — DriverStore folder CreationTime ────────
+# FIX: Session Manager LastWriteTime returns blank (key is too fundamental to
+# Windows to carry a meaningful timestamp). DriverStore folder CreationTime is
+# the next best signal — it's stamped when WU staged the driver, which is the
+# same event that queued the PendingFileRenameOperations flag.
+if ($result.RestartPending -eq "Yes" -and $result.RebootFlagDate -eq "N/A") {
+    if ($driverStoreFolder) {
+        try {
+            Set-DaysPending -flagDateTime $driverStoreFolder.CreationTime -resultObj ([ref]$result)
+            $result.DetectionSource += " | RebootFlagDate-DriverStoreFolder"
+        }
+        catch {}
+    }
+}
+
+# ── Step 12 : Output formatted report ─────────────────────────────────────────
 Write-Output ""
 Write-Output "========================================"
 Write-Output " Lenovo Driver Reboot Detection Report"
@@ -450,7 +439,7 @@ if ($result.RestartPending -eq "Yes") {
 Write-Output "========================================"
 Write-Output ""
 
-# ── Step 12 : Nexthink Remote Action output variables ─────────────────────────
+# ── Step 13 : Nexthink Remote Action output variables ─────────────────────────
 Write-Output "NXT_RestartPending=$($result.RestartPending)"
 Write-Output "NXT_DriverName=$($result.DriverName)"
 Write-Output "NXT_DriverVersion=$($result.DriverVersion)"
