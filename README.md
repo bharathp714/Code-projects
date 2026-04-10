@@ -453,3 +453,9 @@ Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
 # Exit 1 = Restart pending (non-compliant — triggers remediation action)
 # Exit 0 = No restart pending (compliant)
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
+
+$f = Get-ChildItem "C:\Windows\System32\DriverStore\FileRepository" -Directory | 
+     Where-Object { $_.Name -like "lnvvsndmft*" } | Select-Object -First 1
+
+Get-ChildItem $f.FullName | Where-Object { $_.Name -like "lnvvsndmft.inf" } | 
+Select-Object Name, FullName
