@@ -265,9 +265,11 @@ if ($result.RestartPending -eq "Yes") {
                            Select-Object -First 1
 
                 if ($infFile) {
-                    $infContent = Get-Content $infFile.FullName -Raw -ErrorAction SilentlyContinue
-                    # Split into lines for Select-String while preserving full line context
-                    $infContent = $infContent -split "`r?`n"
+                    # Get-Content without -Raw returns string[] directly —
+                    # exactly what Select-String and Get-InfValue expect.
+                    # Using -Raw caused Select-String to behave differently
+                    # on a single string vs an array, breaking INF parsing.
+                    $infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
                 }
             }
 
@@ -465,10 +467,3 @@ Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
 # Exit 1 = Restart pending (non-compliant — triggers remediation action)
 # Exit 0 = No restart pending (compliant)
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
-
-$f = Get-ChildItem "C:\Windows\System32\DriverStore\FileRepository" -Directory |
-     Where-Object { $_.Name -like "lnvvsndmft*" } | Select-Object -First 1
-$inf = Get-ChildItem $f.FullName | Where-Object { $_.Name -like "lnvvsndmft.inf" } | Select-Object -First 1
-$content = Get-Content $inf.FullName -Raw -ErrorAction SilentlyContinue
-Write-Output "Lines: $(($content -split "`n").Count)"
-Write-Output "ServiceDesc match: $(($content | Select-String 'ServiceDescription').Count)"
