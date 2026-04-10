@@ -1,497 +1,271 @@
-# =============================================================================
-# Script  : Lenovo-DriverReboot-Detection.ps1
-# Purpose : Detect Lenovo driver updates (delivered via Intune WUfB driver
-#           policy) that completed successfully but require a restart
-# Output  : Restart Pending (Yes/No), Driver Name, Driver Version,
-#           Driver Built Date, Driver Install Date, Reboot Flag Date,
-#           Days Pending
-# Sources : WU registry keys, WU history (COM), WU event log,
-#           Windows Driver Store, Win32_PnPSignedDriver.DeviceName,
-#           DriverStore folder creation date, INF file [Strings] section,
-#           Hardware ID to PnP device name mapping
-# Usage   : Run locally, via Nexthink Remote Action, or Intune Proactive
-#           Remediation (detection script)
-# =============================================================================
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Reports recent driver updates and reboot status for Intune-managed fleets and Nexthink Remote Actions.
 
-# ── Initialise result object ──────────────────────────────────────────────────
-$result = [PSCustomObject]@{
-    DeviceName        = $env:COMPUTERNAME
-    Manufacturer      = ""
-    RestartPending    = "No"
-    DriverName        = "N/A"
-    DriverVersion     = "N/A"
-    DriverBuiltDate   = "N/A"
-    DriverInstallDate = "N/A"
-    RebootFlagDate    = "N/A"
-    DaysPending       = "N/A"
-    DetectionSource   = "N/A"
-}
+.DESCRIPTION
+    Intended for environments where **Microsoft Intune** > **Devices** > **Windows updates** > **Driver updates**
+    (**Manage driver updates** / Windows driver update policies) approve driver packages in the admin center and
+    **Windows Update** installs them on the device. This script does not call Intune Graph APIs; it reads only
+    local OS state.
 
-# ── Helper : Test if driver name needs further resolution ─────────────────────
-function NameNeedsResolution {
-    param($name)
-    return (
-        $name -eq "N/A"                        -or
-        $name -notmatch "(?i)lenovo"           -or
-        $name -match "(?i)^lenovo extension"   -or
-        $name -match "(?i)^lenovo \w+ driver$"
-    )
-}
+    Lightweight script (no external modules) that:
+    - Reads device name from environment variables
+    - Lists drivers with recent Win32_PnPSignedDriver DriverDate values (default window 7 days)
+    - Detects pending reboot via specified registry locations
+    - Computes time since last boot from Win32_OperatingSystem
+    - Emits a single JSON string suitable for Nexthink structured output
 
-# ── Helper : Parse a named key from INF content ───────────────────────────────
-# FIX: Now handles both INF value formats:
-#   Format A — token reference : ServiceDescription = %ServiceDescription%
-#   Format B — inline quoted   : ServiceDescription="Lenovo Vision Service"
-# Both are common in Lenovo INF files. Previously only Format A was handled.
-function Get-InfValue {
+.NOTES
+    Compatible: PowerShell 5.1+
+    Execution: Standard user or SYSTEM; HKLM reads are required for registry checks.
+    Intune correlation: Approval and assignment are in Intune; on-device rows reflect installed drivers (WMI), not the admin-center approval timestamp.
+#>
+
+[CmdletBinding()]
+param(
+    # Only include drivers whose DriverDate falls within this many days (0 = all with valid dates; default 7)
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 365)]
+    [int]$RecentDays = 7
+)
+
+# Stop on cmdlet errors; explicit try/catch around optional sections prevents hard failures.
+$ErrorActionPreference = 'Stop'
+
+#region Helper: WMI/CIM datetime to .NET DateTime
+function ConvertTo-DateTimeFromWmi {
     param(
-        [string[]] $infContent,
-        [string]   $keyPattern
+        [Parameter(ValueFromPipeline = $true)]
+        $InputObject
     )
-    try {
-        $escapedKey = [regex]::Escape($keyPattern)
-
-        # Pattern stops at = with no trailing \s* so the quote character
-        # immediately after = is preserved for value extraction below.
-        $line = $infContent |
-                Select-String "^\s*$escapedKey\s*=" |
-                Select-Object -First 1
-
-        if (-not $line) { return $null }
-
-        # Split on first = only, then strip whitespace and all quote styles.
-        # Handles both formats:
-        #   ServiceDescription = %Token%
-        #   ServiceDescription="Lenovo Vision Service"
-        $raw = ($line.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
-
-        # If value is a %Token% reference, resolve it from the [Strings] section
-        if ($raw -match '^%(.+)%$') {
-            $token     = [regex]::Escape($Matches[1])
-            $tokenLine = $infContent |
-                         Select-String "^\s*$token\s*=" |
-                         Select-Object -First 1
-            if ($tokenLine) {
-                $raw = ($tokenLine.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
-            }
+    process {
+        if ($null -eq $InputObject) { return $null }
+        if ($InputObject -is [datetime]) { return $InputObject }
+        $s = [string]$InputObject
+        if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+        try {
+            return [System.Management.ManagementDateTimeConverter]::ToDateTime($s)
         }
-
-        return if ($raw -ne "" -and $raw -notmatch "^%") { $raw } else { $null }
+        catch {
+            return $null
+        }
     }
-    catch { return $null }
 }
+#endregion
 
-# ── Helper : Calculate DaysPending from a DateTime ────────────────────────────
-function Set-DaysPending {
-    param([datetime]$flagDateTime, [ref]$resultObj)
-    $resultObj.Value.RebootFlagDate = $flagDateTime.ToString("yyyy-MM-dd HH:mm:ss")
-    $resultObj.Value.DaysPending    = [math]::Round(
-                                          ((Get-Date) - $flagDateTime).TotalDays, 0
-                                      ).ToString()
+#region Device name from environment (per requirement)
+$deviceName = $env:COMPUTERNAME
+if ([string]::IsNullOrWhiteSpace($deviceName)) {
+    $deviceName = 'Unknown'
 }
+#endregion
 
-# ── Step 1 : Confirm this is a Lenovo device ─────────────────────────────────
+#region Time since last reboot (Win32_OperatingSystem.LastBootUpTime)
+$lastBootUtc = $null
+$timeSinceLastRebootHours = $null
+$timeSinceLastRebootDays = $null
+$timeSinceLastRebootDisplay = 'Unknown'
+$lastBootUpTimeIso = $null
+
 try {
-    $manufacturer        = (Get-WmiObject -Class Win32_ComputerSystem).Manufacturer
-    $result.Manufacturer = $manufacturer
-
-    if ($manufacturer -notlike "*Lenovo*") {
-        Write-Output "========================================"
-        Write-Output " Lenovo Driver Reboot Detection Report"
-        Write-Output "========================================"
-        Write-Output "Device Name      : $($result.DeviceName)"
-        Write-Output "Manufacturer     : $manufacturer"
-        Write-Output "Result           : SKIPPED - Not a Lenovo device"
-        Write-Output "========================================"
-        Write-Output "NXT_RestartPending=No"
-        Write-Output "NXT_DriverName=N/A"
-        Write-Output "NXT_DriverVersion=N/A"
-        Write-Output "NXT_DriverBuiltDate=N/A"
-        Write-Output "NXT_DriverInstallDate=N/A"
-        Write-Output "NXT_RebootFlagDate=N/A"
-        Write-Output "NXT_DaysPending=N/A"
-        Write-Output "NXT_DetectionSource=Not a Lenovo device"
-        exit 0
-    }
-}
-catch { $result.Manufacturer = "Unknown" }
-
-# ── Step 2 : Check WU RebootRequired registry key (primary reboot signal) ─────
-$wuRebootKey     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-$wuRebootPending = Test-Path $wuRebootKey
-
-if ($wuRebootPending) {
-    $result.RestartPending  = "Yes"
-    $result.DetectionSource = "WU-RebootRequired-Registry"
-
-    try {
-        $wuKeyItem = Get-Item $wuRebootKey -ErrorAction SilentlyContinue
-        if ($wuKeyItem -and $wuKeyItem.LastWriteTime -and
-            $wuKeyItem.LastWriteTime -gt [datetime]"2000-01-01") {
-            Set-DaysPending -flagDateTime $wuKeyItem.LastWriteTime -resultObj ([ref]$result)
-        }
-    }
-    catch {}
-}
-
-# ── Step 3 : Secondary registry reboot signals ────────────────────────────────
-$rebootSources = @()
-
-$cbs = Get-ItemProperty `
-       "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing" `
-       -ErrorAction SilentlyContinue
-if ($cbs.RebootPending) { $rebootSources += "CBS-RebootPending" }
-
-$sm = Get-ItemProperty `
-      "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
-      -ErrorAction SilentlyContinue
-if ($sm.PendingFileRenameOperations) { $rebootSources += "PendingFileRenameOperations" }
-
-$wuReboot2 = Get-ItemProperty `
-             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" `
-             -ErrorAction SilentlyContinue
-if ($wuReboot2.RebootRequired -eq 1) { $rebootSources += "WU-AutoUpdate-RebootRequired" }
-
-if ($rebootSources.Count -gt 0) {
-    $result.RestartPending = "Yes"
-    if ($result.DetectionSource -eq "N/A") {
-        $result.DetectionSource = $rebootSources -join " | "
-    } else {
-        $result.DetectionSource += " | " + ($rebootSources -join " | ")
-    }
-}
-
-# ── Step 4 : Windows Update history — get driver name + version ───────────────
-if ($result.RestartPending -eq "Yes") {
-    try {
-        $updateSession  = New-Object -ComObject Microsoft.Update.Session
-        $updateSearcher = $updateSession.CreateUpdateSearcher()
-        $historyCount   = $updateSearcher.GetTotalHistoryCount()
-
-        if ($historyCount -gt 0) {
-            $history = $updateSearcher.QueryHistory(0, [Math]::Min($historyCount, 200))
-            $cutoff  = (Get-Date).AddDays(-30)
-
-            # Primary — Lenovo-explicit titles only
-            $lenovoDriverUpdate = $history | Where-Object {
-                $_.ResultCode -eq 2 -and $_.Date -ge $cutoff -and
-                ($_.Title -match "(?i)lenovo" -or $_.Description -match "(?i)lenovo")
-            } | Sort-Object Date -Descending | Select-Object -First 1
-
-            # Secondary — driver keywords, excluding known non-Lenovo vendors
-            if (-not $lenovoDriverUpdate) {
-                $lenovoDriverUpdate = $history | Where-Object {
-                    $_.ResultCode -eq 2 -and $_.Date -ge $cutoff -and
-                    $_.Title -match "(?i)driver|(?i)audio|(?i)sound|(?i)network|(?i)bluetooth|(?i)firmware|(?i)chipset|(?i)video|(?i)display|(?i)storage|(?i)thunderbolt|(?i)fingerprint|(?i)camera" -and
-                    $_.Title -notmatch "(?i)microsoft|(?i)windows defender|(?i)office|(?i)intel|(?i)realtek|(?i)broadcom|(?i)qualcomm|(?i)nvidia|(?i)amd"
-                } | Sort-Object Date -Descending | Select-Object -First 1
+    $os = Get-CimInstance -Namespace root\cimv2 -ClassName Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop
+    if ($null -ne $os -and $null -ne $os.LastBootUpTime) {
+        $lastBootLocal = ConvertTo-DateTimeFromWmi -InputObject $os.LastBootUpTime
+        if ($null -ne $lastBootLocal) {
+            $lastBootUtc = $lastBootLocal.ToUniversalTime()
+            $lastBootUpTimeIso = $lastBootUtc.ToString('o')
+            # Compare in UTC so DST / locale do not skew uptime math.
+            $span = (Get-Date).ToUniversalTime() - $lastBootUtc
+            $timeSinceLastRebootHours = [math]::Round($span.TotalHours, 2)
+            $timeSinceLastRebootDays = [math]::Round($span.TotalDays, 2)
+            if ($span.TotalDays -ge 1) {
+                $timeSinceLastRebootDisplay = ('{0} days ({1:F2} hours)' -f [int][math]::Floor($span.TotalDays), $span.TotalHours)
             }
-
-            if ($lenovoDriverUpdate) {
-                $result.DriverName      = $lenovoDriverUpdate.Title
-                $result.DetectionSource += " | WU-Update-History"
-
-                $versionMatch = [regex]::Match($lenovoDriverUpdate.Title, '\d+\.\d+\.\d+\.\d+')
-                if ($versionMatch.Success) { $result.DriverVersion = $versionMatch.Value }
+            else {
+                $timeSinceLastRebootDisplay = ('{0:F2} hours' -f $span.TotalHours)
             }
         }
     }
-    catch { $result.DetectionSource += " | WU-History-Error: $($_.Exception.Message)" }
 }
+catch {
+    # Leave fields null/Unknown; script continues
+}
+#endregion
 
-# ── Step 5 : Windows Update event log — Event ID 19 / 43 ─────────────────────
-if ($result.RestartPending -eq "Yes") {
+#region Reboot pending — registry checks (per requirement)
+function Test-RegistryRebootPending {
+    $reasons = New-Object System.Collections.Generic.List[string]
+
+    # Component Based Servicing: presence of RebootPending key indicates pending reboot
+    $cbsPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
     try {
-        $cutoff = (Get-Date).AddDays(-30)
-
-        $driverEvents = Get-WinEvent `
-                        -LogName "Microsoft-Windows-WindowsUpdateClient/Operational" `
-                        -ErrorAction SilentlyContinue |
-                        Where-Object {
-                            $_.Id -in @(19, 43) -and $_.TimeCreated -ge $cutoff -and
-                            $_.Message -match "(?i)lenovo|(?i)driver|(?i)audio|(?i)sound"
-                        } | Sort-Object TimeCreated -Descending | Select-Object -First 1
-
-        if ($driverEvents) {
-            $result.DetectionSource += " | WU-EventLog(ID:$($driverEvents.Id))"
-            if ($result.DriverName -eq "N/A") {
-                $titleMatch = [regex]::Match($driverEvents.Message, '(?i)update\s+title[:\s]+(.+)')
-                if ($titleMatch.Success) { $result.DriverName = $titleMatch.Groups[1].Value.Trim() }
-            }
+        if (Test-Path -LiteralPath $cbsPath) {
+            [void]$reasons.Add('CBS_RebootPending')
         }
-
-        $systemRebootEvent = Get-WinEvent -LogName "System" -ErrorAction SilentlyContinue |
-                             Where-Object {
-                                 $_.Id -eq 20 -and $_.TimeCreated -ge $cutoff -and
-                                 $_.ProviderName -match "(?i)WindowsUpdateClient"
-                             } | Sort-Object TimeCreated -Descending | Select-Object -First 1
-
-        if ($systemRebootEvent) { $result.DetectionSource += " | System-EventLog(ID:20)" }
     }
-    catch { $result.DetectionSource += " | EventLog-ReadError" }
-}
+    catch { /* ignore */ }
 
-# ── Step 6 : Driver Store — INF base name + built date + version ──────────────
-$infBaseName       = $null
-$driverStoreFolder = $null
-$infContent        = $null
-
-if ($result.RestartPending -eq "Yes") {
+    # Windows Update: RebootRequired flag or subkey
+    $wuAuto = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update'
     try {
-        $lenovoDriver = Get-WindowsDriver -Online -ErrorAction SilentlyContinue |
-                        Where-Object { $_.ProviderName -like "*Lenovo*" } |
-                        Sort-Object Date -Descending | Select-Object -First 1
-
-        if ($lenovoDriver) {
-            $infBaseName = [System.IO.Path]::GetFileNameWithoutExtension(
-                               $lenovoDriver.OriginalFileName)
-
-            $result.DriverBuiltDate = if ($lenovoDriver.Date) {
-                $lenovoDriver.Date.ToString("yyyy-MM-dd")
-            } else { "N/A" }
-
-            if ($result.DriverVersion -eq "N/A" -and $lenovoDriver.Version) {
-                $result.DriverVersion = $lenovoDriver.Version
-            }
-
-            $driverStoreRoot   = "C:\Windows\System32\DriverStore\FileRepository"
-            $driverStoreFolder = Get-ChildItem -Path $driverStoreRoot -Directory `
-                                 -ErrorAction SilentlyContinue |
-                                 Where-Object { $_.Name -like "$infBaseName*" } |
-                                 Sort-Object CreationTime -Descending | Select-Object -First 1
-
-            # Case-insensitive INF file lookup — confirmed filename on disk is
-            # mixed case "LnvVsnDmft.inf" vs lowercase infBaseName "lnvvsndmft"
-            if ($driverStoreFolder) {
-                $infFile = Get-ChildItem -Path $driverStoreFolder.FullName `
-                           -ErrorAction SilentlyContinue |
-                           Where-Object { $_.Name -like "$infBaseName.inf" } |
-                           Select-Object -First 1
-
-                if ($infFile) {
-                    # Get-Content without -Raw returns string[] directly —
-                    # exactly what Select-String and Get-InfValue expect.
-                    # Using -Raw caused Select-String to behave differently
-                    # on a single string vs an array, breaking INF parsing.
-                    $infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
-                }
-            }
-
-            $result.DetectionSource += " | DriverStore-Enriched"
-
-            # Cross-validate WU history — discard if non-Lenovo vendor matched
-            if ($result.DriverName -ne "N/A" -and
-                $result.DriverName -notmatch "(?i)lenovo" -and
-                $infBaseName -match "^lnv") {
-                $result.DriverName       = "N/A"
-                $result.DetectionSource += " | WU-History-Overridden(non-Lenovo-title)"
-            }
-        }
-    }
-    catch { $result.DetectionSource += " | DriverStore-ReadError: $($_.Exception.Message)" }
-}
-
-# ── Step 7 : Win32_PnPSignedDriver.DeviceName ────────────────────────────────
-# Only accept the resolved name if it contains "Lenovo" — otherwise leave
-# DriverName as-is so Step 9 INF parsing gets a chance to run.
-# Win32_PnPSignedDriver sometimes returns generic or unrelated names for
-# extension/filter drivers which would incorrectly satisfy NameNeedsResolution.
-if ($result.RestartPending -eq "Yes" -and $infBaseName -and (NameNeedsResolution $result.DriverName)) {
-    try {
-        $pnpSigned = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
-                     Where-Object { $_.InfName -like "$infBaseName*" } | Select-Object -First 1
-
-        if ($pnpSigned -and $pnpSigned.DeviceName -and
-            $pnpSigned.DeviceName -ne "" -and
-            $pnpSigned.DeviceName -match "(?i)lenovo") {
-            $result.DriverName = $pnpSigned.DeviceName
-        } elseif ($pnpSigned -and $pnpSigned.Description -and
-                  $pnpSigned.Description -ne "" -and
-                  $pnpSigned.Description -match "(?i)lenovo") {
-            $result.DriverName = $pnpSigned.Description
-        }
-        # If neither contains "Lenovo" — leave DriverName unchanged
-        # so Step 9 INF parsing runs next
-    }
-    catch { $result.DetectionSource += " | PnPSignedDriver-ReadError" }
-}
-
-# ── Step 8 : DriverStore folder creation date — actual WU install date ─────────
-if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
-    try {
-        $folderCreationTime       = $driverStoreFolder.CreationTime
-        $result.DriverInstallDate = $folderCreationTime.ToString("yyyy-MM-dd HH:mm:ss")
-        $result.DetectionSource  += " | DriverStore-FolderDate"
-
-        # FIX: Directly set RebootFlagDate from DriverStore folder CreationTime here
-        # since Session Manager LastWriteTime is unreliable (returns blank).
-        # DriverStore CreationTime = when WU staged the driver = same event that
-        # triggered PendingFileRenameOperations. No conditional check needed —
-        # if WU key already set it in Step 2, this will simply overwrite with the
-        # same or more accurate value.
-        if ($result.RebootFlagDate -eq "N/A") {
-            Set-DaysPending -flagDateTime $folderCreationTime -resultObj ([ref]$result)
-            $result.DetectionSource += " | RebootFlagDate-DriverStoreFolder"
-        }
-    }
-    catch { $result.DetectionSource += " | DriverStore-FolderDate-Error" }
-}
-
-# ── Step 9 : INF file [Strings] parsing ───────────────────────────────────────
-# Direct inline parsing — bypasses Get-InfValue function entirely to avoid
-# any scope or regex issues inside the helper function.
-# Confirmed keys in LnvVsnDmft.inf:
-#   ServiceDescription="Lenovo Vision Service"
-#   InstallServiceDescription="Lenovo View Install Service"
-if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
-
-    # Helper closure — parse key directly from infContent inline
-    $parseInfKey = {
-        param([string]$key)
-        $escapedKey = [regex]::Escape($key)
-        $matched = $infContent | Select-String "^\s*$escapedKey\s*=" | Select-Object -First 1
-        if (-not $matched) { return $null }
-        $val = ($matched.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
-        if ($val -match '^%(.+)%$') {
-            $tok = [regex]::Escape($Matches[1])
-            $tokLine = $infContent | Select-String "^\s*$tok\s*=" | Select-Object -First 1
-            if ($tokLine) { $val = ($tokLine.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'") }
-        }
-        return if ($val -ne "" -and $val -notmatch "^%") { $val } else { $null }
-    }
-
-    # Priority 1 — ServiceDescription → "Lenovo Vision Service"
-    $parsed = & $parseInfKey "ServiceDescription"
-    if ($parsed) {
-        $result.DriverName      = $parsed
-        $result.DetectionSource += " | INF-ServiceDescription"
-    }
-
-    # Priority 2 — InstallServiceDescription → "Lenovo View Install Service"
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "InstallServiceDescription"
-        if ($parsed) {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-InstallServiceDescription"
-        }
-    }
-
-    # Priority 3 — DriverDesc
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "DriverDesc"
-        if ($parsed) {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-DriverDesc"
-        }
-    }
-
-    # Priority 4 — ProductName
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "ProductName"
-        if ($parsed) {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-ProductName"
-        }
-    }
-
-    # Priority 5 — Description
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "Description"
-        if ($parsed -and $parsed -notmatch "^%") {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-Description"
-        }
-    }
-
-    # Priority 6 — Class (skip "Extension" — too generic)
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "Class"
-        if ($parsed -and $parsed -notmatch "^\{" -and $parsed -notmatch "(?i)^extension$") {
-            $result.DriverName      = "Lenovo $parsed Driver"
-            $result.DetectionSource += " | INF-Class"
-        }
-    }
-}
-
-# ── Step 10 : Hardware ID → PnP device name mapping ───────────────────────────
-if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
-    try {
-        $hwIdLines = $infContent |
-                     Select-String '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;]+' |
-                     Select-Object -First 5
-
-        if ($hwIdLines) {
-            $allPnpEntities = Get-WmiObject Win32_PnPEntity -ErrorAction SilentlyContinue
-
-            foreach ($hwIdLine in $hwIdLines) {
-                $hwIdMatch = [regex]::Match(
-                    $hwIdLine.Line,
-                    '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;"]+')
-
-                if ($hwIdMatch.Success) {
-                    $hwId          = $hwIdMatch.Value.Trim()
-                    $matchedDevice = $allPnpEntities | Where-Object {
-                        $_.HardwareID -contains $hwId -and
-                        $_.Name -ne $null -and $_.Name -ne ""
-                    } | Select-Object -First 1
-
-                    if ($matchedDevice) {
-                        $baseName          = $matchedDevice.Name
-                        $result.DriverName = if ($baseName -match "(?i)lenovo") {
-                            $baseName
-                        } else {
-                            "Lenovo Driver Extension - $baseName"
-                        }
-                        $result.DetectionSource += " | HardwareID-PnPMatch"
-                        break
+        if (Test-Path -LiteralPath $wuAuto) {
+            $wuProps = Get-ItemProperty -LiteralPath $wuAuto -ErrorAction SilentlyContinue
+            if ($null -ne $wuProps) {
+                try {
+                    if ([int]$wuProps.RebootRequired -eq 1) {
+                        [void]$reasons.Add('WU_AutoUpdate_RebootRequired')
                     }
                 }
+                catch {
+                    # Property missing or non-numeric; treat as not required.
+                }
+            }
+        }
+        $wuRebootKey = Join-Path $wuAuto 'RebootRequired'
+        if (Test-Path -LiteralPath $wuRebootKey) {
+            [void]$reasons.Add('WU_RebootRequired_Key')
+        }
+    }
+    catch { /* ignore */ }
+
+    # Pending file rename operations (pending reboot to apply)
+    $smPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    try {
+        $pfro = Get-ItemProperty -LiteralPath $smPath -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+        if ($null -ne $pfro) {
+            $val = $pfro.PendingFileRenameOperations
+            $hasContent = $false
+            if ($val -is [string]) {
+                $hasContent = -not [string]::IsNullOrWhiteSpace($val)
+            }
+            elseif ($val -is [array]) {
+                $hasContent = $val.Count -gt 0
+            }
+            else {
+                $hasContent = $null -ne $val
+            }
+            if ($hasContent) {
+                [void]$reasons.Add('PendingFileRenameOperations')
             }
         }
     }
-    catch { $result.DetectionSource += " | HardwareID-LookupError" }
+    catch { /* ignore */ }
 
-    # Absolute last resort — clean INF basename
-    if (NameNeedsResolution $result.DriverName) {
-        $result.DriverName = $infBaseName
+    return [PSCustomObject]@{
+        Pending = ($reasons.Count -gt 0)
+        Reasons = $reasons
     }
 }
 
-# ── Step 11 : Output formatted report ─────────────────────────────────────────
-Write-Output ""
-Write-Output "========================================"
-Write-Output " Lenovo Driver Reboot Detection Report"
-Write-Output "========================================"
-Write-Output "Device Name         : $($result.DeviceName)"
-Write-Output "Manufacturer        : $($result.Manufacturer)"
-Write-Output "Restart Pending     : $($result.RestartPending)"
-
-if ($result.RestartPending -eq "Yes") {
-    Write-Output "Driver Name         : $($result.DriverName)"
-    Write-Output "Driver Version      : $($result.DriverVersion)"
-    Write-Output "Driver Built Date   : $($result.DriverBuiltDate)  (date Lenovo signed the driver)"
-    Write-Output "Driver Install Date : $($result.DriverInstallDate)  (date WU staged it on this device)"
-    Write-Output "Reboot Flag Date    : $($result.RebootFlagDate)  (date reboot pending flag was set)"
-    Write-Output "Days Pending        : $($result.DaysPending) day(s)"
-    Write-Output "Detection Source    : $($result.DetectionSource)"
-} else {
-    Write-Output "Result              : No Lenovo driver restart pending detected"
+$rebootInfo = $null
+try {
+    $rebootInfo = Test-RegistryRebootPending
+}
+catch {
+    $rebootInfo = [PSCustomObject]@{ Pending = $false; Reasons = @() }
 }
 
-Write-Output "========================================"
-Write-Output ""
+$rebootPendingText = if ($rebootInfo.Pending) { 'Yes' } else { 'No' }
+#endregion
 
-# ── Step 12 : Nexthink Remote Action output variables ─────────────────────────
-Write-Output "NXT_RestartPending=$($result.RestartPending)"
-Write-Output "NXT_DriverName=$($result.DriverName)"
-Write-Output "NXT_DriverVersion=$($result.DriverVersion)"
-Write-Output "NXT_DriverBuiltDate=$($result.DriverBuiltDate)"
-Write-Output "NXT_DriverInstallDate=$($result.DriverInstallDate)"
-Write-Output "NXT_RebootFlagDate=$($result.RebootFlagDate)"
-Write-Output "NXT_DaysPending=$($result.DaysPending)"
-Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
+#region Recent drivers — Win32_PnPSignedDriver (DriverDate), optional window filter
+# Intune "Manage driver updates" policies control which drivers Windows Update may install; after install,
+# Win32_PnPSignedDriver reflects what is on box. DriverDate is the signed driver package date from the catalog (INF),
+# a practical proxy for "recent driver activity," not a full audit log of install time (see SetupAPI/logs for that).
+$driverRows = New-Object System.Collections.Generic.List[hashtable]
+$cutoffUtc = $null
+if ($RecentDays -gt 0) {
+    $cutoffUtc = (Get-Date).ToUniversalTime().AddDays(-$RecentDays)
+}
 
-# ── Exit codes for Intune Proactive Remediation ────────────────────────────────
-# Exit 1 = Restart pending (non-compliant — triggers remediation action)
-# Exit 0 = No restart pending (compliant)
-if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
+$allDrivers = @()
+try {
+    if ($RecentDays -gt 0) {
+        # Fast path: push the date predicate into WMI/CIM to avoid enumerating every signed driver on large fleets.
+        $cutoffLocal = (Get-Date).AddDays(-$RecentDays)
+        $dmtf = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime($cutoffLocal)
+        $wql = "SELECT DeviceName, DriverVersion, DriverDate, Manufacturer FROM Win32_PnPSignedDriver WHERE DriverDate >= '$dmtf'"
+        $allDrivers = Get-CimInstance -Query $wql -ErrorAction Stop
+    }
+    else {
+        # No time window: retrieve only needed properties (still enumerates all instances; use RecentDays > 0 when possible).
+        $allDrivers = Get-CimInstance -Namespace root\cimv2 -ClassName Win32_PnPSignedDriver -Property DeviceName, DriverVersion, DriverDate, Manufacturer -ErrorAction Stop
+    }
+}
+catch {
+    try {
+        # Fallback: full enumeration + in-process filter (slower but tolerant if WQL date comparison fails on a specific build).
+        $allDrivers = Get-CimInstance -Namespace root\cimv2 -ClassName Win32_PnPSignedDriver -Property DeviceName, DriverVersion, DriverDate, Manufacturer -ErrorAction Stop
+    }
+    catch {
+        $allDrivers = @()
+    }
+}
+
+foreach ($d in $allDrivers) {
+    $dt = ConvertTo-DateTimeFromWmi -InputObject $d.DriverDate
+    if ($null -eq $dt) { continue }
+
+    $dtUtc = $dt.ToUniversalTime()
+    if ($null -ne $cutoffUtc -and $dtUtc -lt $cutoffUtc) { continue }
+
+    $name = $d.DeviceName
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'Unknown' }
+
+    $ver = $d.DriverVersion
+    if ([string]::IsNullOrWhiteSpace($ver)) { $ver = 'Unknown' }
+
+    $driverRows.Add(@{
+        DriverName        = $name
+        DriverVersion     = $ver
+        DriverInstallDate = $dtUtc.ToString('o')
+        Manufacturer      = if ([string]::IsNullOrWhiteSpace($d.Manufacturer)) { $null } else { $d.Manufacturer }
+    })
+}
+
+# Most recent first (clear ordering when multiple drivers match). @() ensures a single row stays an array (hashtable.Count is ambiguous).
+try {
+    $sorted = @(
+        $driverRows | Sort-Object {
+            [datetime]::Parse($_.DriverInstallDate, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        } -Descending
+    )
+}
+catch {
+    $sorted = @($driverRows)
+}
+#endregion
+
+#region Build result object — single structured payload for Nexthink
+$mostRecentDriverDate = $null
+if ($sorted.Count -gt 0) {
+    $mostRecentDriverDate = $sorted[0].DriverInstallDate
+}
+
+$result = [ordered]@{
+    DeviceName                          = $deviceName
+    # Fixed string so Nexthink parsers and reports can document scope: Intune approves in cloud; WU installs; WMI lists drivers.
+    IntuneDriverUpdatePolicyContext     = 'Drivers are approved/deployed via Intune Windows driver update policies (Manage driver updates); Windows Update installs drivers locally. This output is on-device inventory (WMI) only, not Intune service data.'
+    RebootPending                       = $rebootPendingText
+    RebootPendingReasons                = @($rebootInfo.Reasons)
+    TimeSinceLastRebootHours            = $timeSinceLastRebootHours
+    TimeSinceLastRebootDays             = $timeSinceLastRebootDays
+    TimeSinceLastRebootDisplay          = $timeSinceLastRebootDisplay
+    LastBootUpTimeUtc                   = $lastBootUpTimeIso
+    RecentDriverWindowDays              = $RecentDays
+    MostRecentDriverInstallDateUtc      = $mostRecentDriverDate
+    DriversUpdatedInWindow              = @($sorted)
+    DriversUpdatedInWindowCount         = $sorted.Count
+}
+
+# Nexthink-friendly: one compressed JSON line (UTF-8 safe for typical ASCII field names)
+try {
+    $json = $result | ConvertTo-Json -Depth 6 -Compress
+}
+catch {
+    $json = '{"Error":"Failed to serialize output"}'
+}
+
+Write-Output $json
+#endregion
