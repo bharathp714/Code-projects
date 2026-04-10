@@ -338,10 +338,30 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
 }
 
 # ── Step 9 : INF file [Strings] parsing ───────────────────────────────────────
+# Direct inline parsing — bypasses Get-InfValue function entirely to avoid
+# any scope or regex issues inside the helper function.
+# Confirmed keys in LnvVsnDmft.inf:
+#   ServiceDescription="Lenovo Vision Service"
+#   InstallServiceDescription="Lenovo View Install Service"
 if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
 
+    # Helper closure — parse key directly from infContent inline
+    $parseInfKey = {
+        param([string]$key)
+        $escapedKey = [regex]::Escape($key)
+        $matched = $infContent | Select-String "^\s*$escapedKey\s*=" | Select-Object -First 1
+        if (-not $matched) { return $null }
+        $val = ($matched.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
+        if ($val -match '^%(.+)%$') {
+            $tok = [regex]::Escape($Matches[1])
+            $tokLine = $infContent | Select-String "^\s*$tok\s*=" | Select-Object -First 1
+            if ($tokLine) { $val = ($tokLine.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'") }
+        }
+        return if ($val -ne "" -and $val -notmatch "^%") { $val } else { $null }
+    }
+
     # Priority 1 — ServiceDescription → "Lenovo Vision Service"
-    $parsed = Get-InfValue -infContent $infContent -keyPattern "ServiceDescription"
+    $parsed = & $parseInfKey "ServiceDescription"
     if ($parsed) {
         $result.DriverName      = $parsed
         $result.DetectionSource += " | INF-ServiceDescription"
@@ -349,7 +369,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
 
     # Priority 2 — InstallServiceDescription → "Lenovo View Install Service"
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = Get-InfValue -infContent $infContent -keyPattern "InstallServiceDescription"
+        $parsed = & $parseInfKey "InstallServiceDescription"
         if ($parsed) {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-InstallServiceDescription"
@@ -358,7 +378,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
 
     # Priority 3 — DriverDesc
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = Get-InfValue -infContent $infContent -keyPattern "DriverDesc"
+        $parsed = & $parseInfKey "DriverDesc"
         if ($parsed) {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-DriverDesc"
@@ -367,7 +387,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
 
     # Priority 4 — ProductName
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = Get-InfValue -infContent $infContent -keyPattern "ProductName"
+        $parsed = & $parseInfKey "ProductName"
         if ($parsed) {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-ProductName"
@@ -376,7 +396,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
 
     # Priority 5 — Description
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = Get-InfValue -infContent $infContent -keyPattern "Description"
+        $parsed = & $parseInfKey "Description"
         if ($parsed -and $parsed -notmatch "^%") {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-Description"
@@ -385,7 +405,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
 
     # Priority 6 — Class (skip "Extension" — too generic)
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = Get-InfValue -infContent $infContent -keyPattern "Class"
+        $parsed = & $parseInfKey "Class"
         if ($parsed -and $parsed -notmatch "^\{" -and $parsed -notmatch "(?i)^extension$") {
             $result.DriverName      = "Lenovo $parsed Driver"
             $result.DetectionSource += " | INF-Class"
