@@ -38,6 +38,10 @@ $result = [PSCustomObject]@{
     LastShutdownDetectionSource  = "N/A"
     TimeSinceLastShutdownDays    = "N/A"
     TimeSinceLastShutdownDisplay = "N/A"
+    BootAfterRebootFlagTimestamp = "N/A"
+    PendingTimingNote            = "N/A"
+    Shutdown1074NewerThanLastBoot = "N/A"
+    Shutdown1074VsBootNote       = "N/A"
 }
 
 # ── Helper : Test if driver name needs further resolution ─────────────────────
@@ -105,10 +109,12 @@ function Set-DaysPending {
 function Set-SystemBootAndShutdownInfo {
     param([PSCustomObject]$Result)
 
+    $lastBootLocalRef = $null
     try {
         $wmiOs = Get-WmiObject -Class Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop
         if ($null -ne $wmiOs -and $null -ne $wmiOs.LastBootUpTime) {
             $lastBootLocal = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$wmiOs.LastBootUpTime)
+            $lastBootLocalRef = $lastBootLocal
             $lastBootUtc   = $lastBootLocal.ToUniversalTime()
             $Result.LastBootUpTimeLocal = $lastBootLocal.ToString("yyyy-MM-dd HH:mm:ss")
             $Result.LastBootUpTimeUtc   = $lastBootUtc.ToString("o")
@@ -125,9 +131,9 @@ function Set-SystemBootAndShutdownInfo {
     }
     catch { }
 
+    $shutdownEvent = $null
+    $shutdownSrc   = $null
     try {
-        $shutdownEvent = $null
-        $shutdownSrc   = $null
         $ev1074 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1074 } -MaxEvents 1 -ErrorAction SilentlyContinue
         if ($ev1074) {
             $shutdownEvent = $ev1074
@@ -154,9 +160,47 @@ function Set-SystemBootAndShutdownInfo {
         }
     }
     catch { }
+
+    # Newest 1074/6006 is not always "the shutdown before this boot" (Fast Startup, reboot during session, etc.).
+    if ($null -ne $lastBootLocalRef -and $null -ne $shutdownEvent) {
+        if ($shutdownEvent.TimeCreated -gt $lastBootLocalRef) {
+            $Result.Shutdown1074NewerThanLastBoot = "Yes"
+            $Result.Shutdown1074VsBootNote = "Latest System log shutdown/restart event is NEWER than LastBootUpTime. It may be a restart initiated during this session or logging order effects; use Last OS boot as the start of the current session."
+        }
+        else {
+            $Result.Shutdown1074NewerThanLastBoot = "No"
+            $Result.Shutdown1074VsBootNote = "N/A"
+        }
+    }
 }
 
 Set-SystemBootAndShutdownInfo -Result $result
+
+# ── Reconcile reboot-flag / staged time vs last OS boot ───────────────────────
+# RebootFlagDate often equals DriverStore folder time or an old registry write; the PC may have
+# rebooted since then while PendingFileRenameOperations or other keys still read "pending".
+function Set-PendingRebootTimingContext {
+    param([PSCustomObject]$Result)
+    $Result.BootAfterRebootFlagTimestamp = "N/A"
+    $Result.PendingTimingNote            = "N/A"
+    if ($Result.RestartPending -ne "Yes") { return }
+    if ($Result.RebootFlagDate -eq "N/A" -or $Result.LastBootUpTimeLocal -eq "N/A") { return }
+    try {
+        $fmt       = "yyyy-MM-dd HH:mm:ss"
+        $bootLocal = [datetime]::ParseExact($Result.LastBootUpTimeLocal.Trim(), $fmt, [System.Globalization.DateTimeFormatInfo]::InvariantInfo)
+        $flagLocal = [datetime]::ParseExact($Result.RebootFlagDate.Trim(), $fmt, [System.Globalization.DateTimeFormatInfo]::InvariantInfo)
+        if ($bootLocal -gt $flagLocal) {
+            $Result.BootAfterRebootFlagTimestamp = "Yes"
+            $Result.PendingTimingNote = "Last OS boot is AFTER the reboot-flag/staged timestamp: the PC already restarted since that point. Days Pending counts days since that older timestamp (driver staging/flag), not uninterrupted time without a reboot. Restart Pending can stay Yes due to registry signals (often stale PendingFileRenameOperations) unrelated to the Lenovo driver needing a first reboot."
+        }
+        else {
+            $Result.BootAfterRebootFlagTimestamp = "No"
+        }
+    }
+    catch {
+        $Result.BootAfterRebootFlagTimestamp = "N/A"
+    }
+}
 
 # ── Step 1 : Confirm this is a Lenovo device ─────────────────────────────────
 try {
@@ -196,6 +240,10 @@ try {
         Write-Output "NXT_LastShutdownDetectionSource=$($result.LastShutdownDetectionSource)"
         Write-Output "NXT_TimeSinceLastShutdownDays=$($result.TimeSinceLastShutdownDays)"
         Write-Output "NXT_TimeSinceLastShutdownDisplay=$($result.TimeSinceLastShutdownDisplay)"
+        Write-Output "NXT_BootAfterRebootFlagTimestamp=N/A"
+        Write-Output "NXT_PendingTimingNote=N/A"
+        Write-Output "NXT_Shutdown1074NewerThanLastBoot=$($result.Shutdown1074NewerThanLastBoot)"
+        Write-Output "NXT_Shutdown1074VsBootNote=$($result.Shutdown1074VsBootNote)"
         exit 0
     }
 }
@@ -530,6 +578,8 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
     }
 }
 
+Set-PendingRebootTimingContext -Result $result
+
 # ── Step 11 : Output formatted report ─────────────────────────────────────────
 Write-Output ""
 Write-Output "========================================"
@@ -545,6 +595,10 @@ Write-Output "Time since last boot: $($result.TimeSinceLastBootDisplay)  (hours=
 Write-Output "Last shutdown/restart (System log): $($result.LastShutdownTimeLocal)"
 Write-Output "  (how detected)    : $($result.LastShutdownDetectionSource)"
 Write-Output "Time since that event: $($result.TimeSinceLastShutdownDisplay)  (days=$($result.TimeSinceLastShutdownDays))"
+if ($result.Shutdown1074NewerThanLastBoot -eq "Yes") {
+    Write-Output ""
+    Write-Output "Note (shutdown log) : $($result.Shutdown1074VsBootNote)"
+}
 Write-Output ""
 
 if ($result.RestartPending -eq "Yes") {
@@ -556,7 +610,11 @@ if ($result.RestartPending -eq "Yes") {
     Write-Output "  -> Meaning        : DriverStore FileRepository folder creation time - proxy for when Windows staged/copied the package onto this disk (often close to WU apply)."
     Write-Output "Reboot Flag Date    : $($result.RebootFlagDate)"
     Write-Output "  -> Meaning        : Timestamp used for this report pending-reboot age (registry key write, or DriverStore folder time if registry time was unknown)."
-    Write-Output "Days Pending        : $($result.DaysPending) day(s)  (since reboot-flag timestamp above)"
+    Write-Output "Days Pending        : $($result.DaysPending) day(s)  (calendar days since reboot-flag/staged timestamp above - not the same as time since last boot)"
+    Write-Output "Boot after flag?    : $($result.BootAfterRebootFlagTimestamp)  (Yes = OS booted AFTER that timestamp; pending registry may be stale)"
+    if ($result.PendingTimingNote -ne "N/A") {
+        Write-Output "  -> Detail         : $($result.PendingTimingNote)"
+    }
     Write-Output "Detection Source    : $($result.DetectionSource)"
 } else {
     Write-Output "Result              : No Lenovo driver restart pending detected"
@@ -584,6 +642,10 @@ Write-Output "NXT_LastShutdownTimeLocal=$($result.LastShutdownTimeLocal)"
 Write-Output "NXT_LastShutdownDetectionSource=$($result.LastShutdownDetectionSource)"
 Write-Output "NXT_TimeSinceLastShutdownDays=$($result.TimeSinceLastShutdownDays)"
 Write-Output "NXT_TimeSinceLastShutdownDisplay=$($result.TimeSinceLastShutdownDisplay)"
+Write-Output "NXT_BootAfterRebootFlagTimestamp=$($result.BootAfterRebootFlagTimestamp)"
+Write-Output "NXT_PendingTimingNote=$($result.PendingTimingNote)"
+Write-Output "NXT_Shutdown1074NewerThanLastBoot=$($result.Shutdown1074NewerThanLastBoot)"
+Write-Output "NXT_Shutdown1074VsBootNote=$($result.Shutdown1074VsBootNote)"
 
 # ── Exit codes for Intune Proactive Remediation ────────────────────────────────
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
