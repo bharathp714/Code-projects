@@ -5,7 +5,8 @@
 #           policy) that completed successfully but require a restart
 # Output  : Restart Pending (Yes/No), Driver Name, Driver Version,
 #           Driver Built Date, Driver Install Date, Reboot Flag Date,
-#           Days Pending
+#           Days Pending, Last OS boot & time-since-boot, last shutdown/restart
+#           event from System log with time-since-that-event
 # Sources : WU registry keys, WU history (COM), WU event log,
 #           Windows Driver Store, Win32_PnPSignedDriver.DeviceName,
 #           DriverStore folder creation date, INF file [Strings] section,
@@ -18,16 +19,25 @@
 
 # ── Initialise result object ──────────────────────────────────────────────────
 $result = [PSCustomObject]@{
-    DeviceName        = $env:COMPUTERNAME
-    Manufacturer      = ""
-    RestartPending    = "No"
-    DriverName        = "N/A"
-    DriverVersion     = "N/A"
-    DriverBuiltDate   = "N/A"
-    DriverInstallDate = "N/A"
-    RebootFlagDate    = "N/A"
-    DaysPending       = "N/A"
-    DetectionSource   = "N/A"
+    DeviceName                   = $env:COMPUTERNAME
+    Manufacturer                 = ""
+    RestartPending               = "No"
+    DriverName                   = "N/A"
+    DriverVersion                = "N/A"
+    DriverBuiltDate              = "N/A"
+    DriverInstallDate            = "N/A"
+    RebootFlagDate               = "N/A"
+    DaysPending                  = "N/A"
+    DetectionSource              = "N/A"
+    LastBootUpTimeLocal          = "N/A"
+    LastBootUpTimeUtc            = "N/A"
+    TimeSinceLastBootHours       = "N/A"
+    TimeSinceLastBootDays        = "N/A"
+    TimeSinceLastBootDisplay     = "N/A"
+    LastShutdownTimeLocal        = "N/A"
+    LastShutdownDetectionSource  = "N/A"
+    TimeSinceLastShutdownDays    = "N/A"
+    TimeSinceLastShutdownDisplay = "N/A"
 }
 
 # ── Helper : Test if driver name needs further resolution ─────────────────────
@@ -87,6 +97,67 @@ function Set-DaysPending {
                                       ).ToString()
 }
 
+# ── OS uptime & last shutdown / restart (all devices) ─────────────────────────
+# Last boot: Win32_OperatingSystem.LastBootUpTime (WMI DMTF first for PS 5.1 consistency).
+# Last shutdown/restart: newest System log Event 1074 (user/system initiated shutdown or restart);
+#   fallback 6006 (Event Log service stopped — common at shutdown). Not identical to "power off"
+#   for every scenario (Fast Startup, crash, etc.) but matches typical graceful cycles.
+function Set-SystemBootAndShutdownInfo {
+    param([PSCustomObject]$Result)
+
+    try {
+        $wmiOs = Get-WmiObject -Class Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop
+        if ($null -ne $wmiOs -and $null -ne $wmiOs.LastBootUpTime) {
+            $lastBootLocal = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$wmiOs.LastBootUpTime)
+            $lastBootUtc   = $lastBootLocal.ToUniversalTime()
+            $Result.LastBootUpTimeLocal = $lastBootLocal.ToString("yyyy-MM-dd HH:mm:ss")
+            $Result.LastBootUpTimeUtc   = $lastBootUtc.ToString("o")
+            $span = [datetime]::UtcNow - $lastBootUtc
+            $Result.TimeSinceLastBootHours = [math]::Round($span.TotalHours, 2).ToString()
+            $Result.TimeSinceLastBootDays  = [math]::Round($span.TotalDays, 2).ToString()
+            if ($span.TotalDays -ge 1) {
+                $Result.TimeSinceLastBootDisplay = ('{0} days ({1:F1} h)' -f [int][math]::Floor($span.TotalDays), $span.TotalHours)
+            }
+            else {
+                $Result.TimeSinceLastBootDisplay = ('{0:F2} hours' -f $span.TotalHours)
+            }
+        }
+    }
+    catch { }
+
+    try {
+        $shutdownEvent = $null
+        $shutdownSrc   = $null
+        $ev1074 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1074 } -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($ev1074) {
+            $shutdownEvent = $ev1074
+            $shutdownSrc   = 'System_EventID_1074_shutdown_or_restart_initiated'
+        }
+        if (-not $shutdownEvent) {
+            $ev6006 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6006 } -MaxEvents 1 -ErrorAction SilentlyContinue
+            if ($ev6006) {
+                $shutdownEvent = $ev6006
+                $shutdownSrc   = 'System_EventID_6006_event_log_stopped_proxy_for_shutdown'
+            }
+        }
+        if ($shutdownEvent) {
+            $Result.LastShutdownTimeLocal = $shutdownEvent.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
+            $Result.LastShutdownDetectionSource = $shutdownSrc
+            $sdSpan = (Get-Date) - $shutdownEvent.TimeCreated
+            $Result.TimeSinceLastShutdownDays = [math]::Round($sdSpan.TotalDays, 2).ToString()
+            if ($sdSpan.TotalDays -ge 1) {
+                $Result.TimeSinceLastShutdownDisplay = ('{0} days ({1:F1} h)' -f [int][math]::Floor($sdSpan.TotalDays), $sdSpan.TotalHours)
+            }
+            else {
+                $Result.TimeSinceLastShutdownDisplay = ('{0:F2} hours' -f $sdSpan.TotalHours)
+            }
+        }
+    }
+    catch { }
+}
+
+Set-SystemBootAndShutdownInfo -Result $result
+
 # ── Step 1 : Confirm this is a Lenovo device ─────────────────────────────────
 try {
     $manufacturer        = (Get-WmiObject -Class Win32_ComputerSystem).Manufacturer
@@ -99,15 +170,32 @@ try {
         Write-Output "Device Name      : $($result.DeviceName)"
         Write-Output "Manufacturer     : $manufacturer"
         Write-Output "Result           : SKIPPED - Not a Lenovo device"
+        Write-Output ""
+        Write-Output "Last OS boot (local)     : $($result.LastBootUpTimeLocal)"
+        Write-Output "  (UTC)                  : $($result.LastBootUpTimeUtc)"
+        Write-Output "Time since last boot     : $($result.TimeSinceLastBootDisplay)  [h=$($result.TimeSinceLastBootHours), d=$($result.TimeSinceLastBootDays)]"
+        Write-Output "Last shutdown/restart evt: $($result.LastShutdownTimeLocal)"
+        Write-Output "  (detection)            : $($result.LastShutdownDetectionSource)"
+        Write-Output "Time since that event    : $($result.TimeSinceLastShutdownDisplay)  [d=$($result.TimeSinceLastShutdownDays)]"
         Write-Output "========================================"
         Write-Output "NXT_RestartPending=No"
         Write-Output "NXT_DriverName=N/A"
         Write-Output "NXT_DriverVersion=N/A"
         Write-Output "NXT_DriverBuiltDate=N/A"
         Write-Output "NXT_DriverInstallDate=N/A"
+        Write-Output "NXT_DriverStagedDate=N/A"
         Write-Output "NXT_RebootFlagDate=N/A"
         Write-Output "NXT_DaysPending=N/A"
         Write-Output "NXT_DetectionSource=Not a Lenovo device"
+        Write-Output "NXT_LastBootUpTimeLocal=$($result.LastBootUpTimeLocal)"
+        Write-Output "NXT_LastBootUpTimeUtc=$($result.LastBootUpTimeUtc)"
+        Write-Output "NXT_TimeSinceLastBootHours=$($result.TimeSinceLastBootHours)"
+        Write-Output "NXT_TimeSinceLastBootDays=$($result.TimeSinceLastBootDays)"
+        Write-Output "NXT_TimeSinceLastBootDisplay=$($result.TimeSinceLastBootDisplay)"
+        Write-Output "NXT_LastShutdownTimeLocal=$($result.LastShutdownTimeLocal)"
+        Write-Output "NXT_LastShutdownDetectionSource=$($result.LastShutdownDetectionSource)"
+        Write-Output "NXT_TimeSinceLastShutdownDays=$($result.TimeSinceLastShutdownDays)"
+        Write-Output "NXT_TimeSinceLastShutdownDisplay=$($result.TimeSinceLastShutdownDisplay)"
         exit 0
     }
 }
@@ -450,14 +538,25 @@ Write-Output "========================================"
 Write-Output "Device Name         : $($result.DeviceName)"
 Write-Output "Manufacturer        : $($result.Manufacturer)"
 Write-Output "Restart Pending     : $($result.RestartPending)"
+Write-Output ""
+Write-Output "Last OS boot (local): $($result.LastBootUpTimeLocal)"
+Write-Output "  (UTC)             : $($result.LastBootUpTimeUtc)"
+Write-Output "Time since last boot: $($result.TimeSinceLastBootDisplay)  (hours=$($result.TimeSinceLastBootHours), days=$($result.TimeSinceLastBootDays))"
+Write-Output "Last shutdown/restart (System log): $($result.LastShutdownTimeLocal)"
+Write-Output "  (how detected)    : $($result.LastShutdownDetectionSource)"
+Write-Output "Time since that event: $($result.TimeSinceLastShutdownDisplay)  (days=$($result.TimeSinceLastShutdownDays))"
+Write-Output ""
 
 if ($result.RestartPending -eq "Yes") {
     Write-Output "Driver Name         : $($result.DriverName)"
     Write-Output "Driver Version      : $($result.DriverVersion)"
-    Write-Output "Driver Built Date   : $($result.DriverBuiltDate)  (date Lenovo signed the driver)"
-    Write-Output "Driver Install Date : $($result.DriverInstallDate)  (date WU staged it on this device)"
-    Write-Output "Reboot Flag Date    : $($result.RebootFlagDate)  (date reboot pending flag was set)"
-    Write-Output "Days Pending        : $($result.DaysPending) day(s)"
+    Write-Output "Driver Built Date   : $($result.DriverBuiltDate)"
+    Write-Output "  -> Meaning        : Date from the driver package / Windows Driver Store (catalog build date). Not necessarily the day the update was installed on this PC."
+    Write-Output "Driver Staged Date  : $($result.DriverInstallDate)"
+    Write-Output "  -> Meaning        : DriverStore FileRepository folder creation time - proxy for when Windows staged/copied the package onto this disk (often close to WU apply)."
+    Write-Output "Reboot Flag Date    : $($result.RebootFlagDate)"
+    Write-Output "  -> Meaning        : Timestamp used for this report pending-reboot age (registry key write, or DriverStore folder time if registry time was unknown)."
+    Write-Output "Days Pending        : $($result.DaysPending) day(s)  (since reboot-flag timestamp above)"
     Write-Output "Detection Source    : $($result.DetectionSource)"
 } else {
     Write-Output "Result              : No Lenovo driver restart pending detected"
@@ -472,9 +571,19 @@ Write-Output "NXT_DriverName=$($result.DriverName)"
 Write-Output "NXT_DriverVersion=$($result.DriverVersion)"
 Write-Output "NXT_DriverBuiltDate=$($result.DriverBuiltDate)"
 Write-Output "NXT_DriverInstallDate=$($result.DriverInstallDate)"
+Write-Output "NXT_DriverStagedDate=$($result.DriverInstallDate)"
 Write-Output "NXT_RebootFlagDate=$($result.RebootFlagDate)"
 Write-Output "NXT_DaysPending=$($result.DaysPending)"
 Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
+Write-Output "NXT_LastBootUpTimeLocal=$($result.LastBootUpTimeLocal)"
+Write-Output "NXT_LastBootUpTimeUtc=$($result.LastBootUpTimeUtc)"
+Write-Output "NXT_TimeSinceLastBootHours=$($result.TimeSinceLastBootHours)"
+Write-Output "NXT_TimeSinceLastBootDays=$($result.TimeSinceLastBootDays)"
+Write-Output "NXT_TimeSinceLastBootDisplay=$($result.TimeSinceLastBootDisplay)"
+Write-Output "NXT_LastShutdownTimeLocal=$($result.LastShutdownTimeLocal)"
+Write-Output "NXT_LastShutdownDetectionSource=$($result.LastShutdownDetectionSource)"
+Write-Output "NXT_TimeSinceLastShutdownDays=$($result.TimeSinceLastShutdownDays)"
+Write-Output "NXT_TimeSinceLastShutdownDisplay=$($result.TimeSinceLastShutdownDisplay)"
 
 # ── Exit codes for Intune Proactive Remediation ────────────────────────────────
 if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
