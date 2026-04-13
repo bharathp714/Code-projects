@@ -474,28 +474,28 @@ if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
 if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
 
     $parseInfKey = {
-        param([string]$key)
+        param([string[]]$content, [string]$key)
         $escapedKey = [regex]::Escape($key)
-        $matched = $infContent | Select-String "^\s*$escapedKey\s*=" | Select-Object -First 1
+        $matched = $content | Select-String "^\s*$escapedKey\s*=" | Select-Object -First 1
         if (-not $matched) { return $null }
         $val = ($matched.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
         if ($val -match '^%(.+)%$') {
             $tok = [regex]::Escape($Matches[1])
-            $tokLine = $infContent | Select-String "^\s*$tok\s*=" | Select-Object -First 1
+            $tokLine = $content | Select-String "^\s*$tok\s*=" | Select-Object -First 1
             if ($tokLine) { $val = ($tokLine.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'") }
         }
         if ($val -ne "" -and $val -notmatch "^%") { return $val }
         return $null
     }
 
-    $parsed = & $parseInfKey "ServiceDescription"
+    $parsed = & $parseInfKey $infContent "ServiceDescription"
     if ($parsed) {
         $result.DriverName      = $parsed
         $result.DetectionSource += " | INF-ServiceDescription"
     }
 
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "InstallServiceDescription"
+        $parsed = & $parseInfKey $infContent "InstallServiceDescription"
         if ($parsed) {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-InstallServiceDescription"
@@ -503,7 +503,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
     }
 
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "DriverDesc"
+        $parsed = & $parseInfKey $infContent "DriverDesc"
         if ($parsed) {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-DriverDesc"
@@ -511,7 +511,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
     }
 
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "ProductName"
+        $parsed = & $parseInfKey $infContent "ProductName"
         if ($parsed) {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-ProductName"
@@ -519,7 +519,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
     }
 
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "Description"
+        $parsed = & $parseInfKey $infContent "Description"
         if ($parsed -and $parsed -notmatch "^%") {
             $result.DriverName      = $parsed
             $result.DetectionSource += " | INF-Description"
@@ -527,7 +527,7 @@ if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution 
     }
 
     if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey "Class"
+        $parsed = & $parseInfKey $infContent "Class"
         if ($parsed -and $parsed -notmatch "^\{" -and $parsed -notmatch "(?i)^extension$") {
             $result.DriverName      = "Lenovo $parsed Driver"
             $result.DetectionSource += " | INF-Class"
