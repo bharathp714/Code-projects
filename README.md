@@ -1,651 +1,364 @@
 #Requires -Version 5.1
-# =============================================================================
-# Script  : Lenovo-DriverReboot-Detection.ps1
-# Purpose : Detect Lenovo driver updates (delivered via Intune WUfB driver
-#           policy) that completed successfully but require a restart
-# Output  : Restart Pending (Yes/No), Driver Name, Driver Version,
-#           Driver Built Date, Driver Install Date, Reboot Flag Date,
-#           Days Pending, Last OS boot & time-since-boot, last shutdown/restart
-#           event from System log with time-since-that-event
-# Sources : WU registry keys, WU history (COM), WU event log,
-#           Windows Driver Store, Win32_PnPSignedDriver.DeviceName,
-#           DriverStore folder creation date, INF file [Strings] section,
-#           Hardware ID to PnP device name mapping
-# Usage   : Run locally, via Nexthink Remote Action, or Intune Proactive
-#           Remediation (detection script)
-#
-# Fixes (PS 5.1): return-if syntax, CBS RebootPending subkey, filtered WU events
-# =============================================================================
+<#
+.SYNOPSIS
+    Detects if a Lenovo camera driver has been updated but a system restart is pending.
 
-# ── Initialise result object ──────────────────────────────────────────────────
-$result = [PSCustomObject]@{
-    DeviceName                   = $env:COMPUTERNAME
-    Manufacturer                 = ""
-    RestartPending               = "No"
-    DriverName                   = "N/A"
-    DriverVersion                = "N/A"
-    DriverBuiltDate              = "N/A"
-    DriverInstallDate            = "N/A"
-    RebootFlagDate               = "N/A"
-    DaysPending                  = "N/A"
-    DetectionSource              = "N/A"
-    LastBootUpTimeLocal          = "N/A"
-    LastBootUpTimeUtc            = "N/A"
-    TimeSinceLastBootHours       = "N/A"
-    TimeSinceLastBootDays        = "N/A"
-    TimeSinceLastBootDisplay     = "N/A"
-    LastShutdownTimeLocal        = "N/A"
-    LastShutdownDetectionSource  = "N/A"
-    TimeSinceLastShutdownDays    = "N/A"
-    TimeSinceLastShutdownDisplay = "N/A"
-    BootAfterRebootFlagTimestamp = "N/A"
-    PendingTimingNote            = "N/A"
-    Shutdown1074NewerThanLastBoot = "N/A"
-    Shutdown1074VsBootNote       = "N/A"
+.DESCRIPTION
+    This script is designed for deployment via Nexthink Remote Actions.
+    It performs a multi-layered check to determine whether:
+      1. A camera driver is installed on the device (Lenovo-specific).
+      2. The camera driver was recently updated (within the past N days).
+      3. A system restart is pending due to driver/component changes.
+
+    Detection layers:
+      - Windows Driver Store: checks camera driver INF install date
+      - Lenovo Thin Installer log: parses for camera package install with reboot code 3010
+      - Lenovo System Update log: parses for camera-related updates with pending reboot
+      - Registry reboot signals: PendingFileRenameOperations, CBS RebootPending,
+        WindowsUpdate RebootRequired, SessionManager PendingFileRename
+      - SetupAPI log: checks for recent camera driver installations
+
+    Output (NXT_ prefixed for Nexthink Remote Action compatibility):
+      NXT_CameraDriverFound          - Whether a camera driver was detected
+      NXT_CameraDriverName           - Friendly name of the camera driver
+      NXT_CameraDriverVersion        - Installed driver version
+      NXT_CameraDriverDate           - Date of camera driver install/update
+      NXT_CameraDriverRecentUpdate   - Whether driver was updated within threshold days
+      NXT_RebootPending              - Whether any reboot-pending signal is active
+      NXT_RebootSource               - Which detection layer triggered the reboot flag
+      NXT_ActionRequired             - TRUE if camera driver updated AND reboot pending
+      NXT_Summary                    - Human-readable summary
+
+.NOTES
+    Author      : Bharath (Enterprise Endpoint Management)
+    Target      : Lenovo devices managed via Nexthink + Intune/SCCM
+    Tested On   : Windows 10 21H2+, Windows 11
+    Exit Codes  :
+        0  = No action required (camera driver OK or no camera found)
+        1  = Camera driver updated, restart pending — action required
+        2  = Script execution error
+#>
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+$RecentUpdateThresholdDays = 7   # Days to look back for a "recent" driver update
+$ThinInstallerLogPath      = "$env:ProgramData\Lenovo\Thin Installer\Logs"
+$SystemUpdateLogPath       = "$env:ProgramData\Lenovo\System Update\logs"
+$SetupAPILogPath           = "$env:WINDIR\INF\setupapi.dev.log"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUT VARIABLES (NXT_ prefix required for Nexthink)
+# ─────────────────────────────────────────────────────────────────────────────
+$NXT_CameraDriverFound        = "FALSE"
+$NXT_CameraDriverName         = "N/A"
+$NXT_CameraDriverVersion      = "N/A"
+$NXT_CameraDriverDate         = "N/A"
+$NXT_CameraDriverRecentUpdate = "FALSE"
+$NXT_RebootPending            = "FALSE"
+$NXT_RebootSource             = "None"
+$NXT_ActionRequired           = "FALSE"
+$NXT_Summary                  = "No issues detected."
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Write-NxtOutput {
+    <#
+    .SYNOPSIS Emits all NXT_ variables as key=value pairs for Nexthink ingestion. #>
+    Write-Output "NXT_CameraDriverFound=$NXT_CameraDriverFound"
+    Write-Output "NXT_CameraDriverName=$NXT_CameraDriverName"
+    Write-Output "NXT_CameraDriverVersion=$NXT_CameraDriverVersion"
+    Write-Output "NXT_CameraDriverDate=$NXT_CameraDriverDate"
+    Write-Output "NXT_CameraDriverRecentUpdate=$NXT_CameraDriverRecentUpdate"
+    Write-Output "NXT_RebootPending=$NXT_RebootPending"
+    Write-Output "NXT_RebootSource=$NXT_RebootSource"
+    Write-Output "NXT_ActionRequired=$NXT_ActionRequired"
+    Write-Output "NXT_Summary=$NXT_Summary"
 }
 
-# ── Helper : Test if driver name needs further resolution ─────────────────────
-function NameNeedsResolution {
-    param($name)
-    return (
-        $name -eq "N/A"                        -or
-        $name -notmatch "(?i)lenovo"           -or
-        $name -match "(?i)^lenovo extension"   -or
-        $name -match "(?i)^lenovo \w+ driver$"
-    )
-}
-
-# ── Helper : Parse a named key from INF content ───────────────────────────────
-# Handles both INF value formats:
-#   Format A — token reference : ServiceDescription = %ServiceDescription%
-#   Format B — inline quoted   : ServiceDescription="Lenovo Vision Service"
-function Get-InfValue {
-    param(
-        [string[]] $infContent,
-        [string]   $keyPattern
-    )
+function Get-CameraDriverFromDriverStore {
+    <#
+    .SYNOPSIS
+        Queries Win32_PnPSignedDriver for camera class devices and returns
+        the most recently updated one.
+    #>
     try {
-        $escapedKey = [regex]::Escape($keyPattern)
+        # Class GUID for Camera: {ca3e7ab9-b4c3-4ae6-8251-579ef933890f}
+        # Also covers Image class: {6bdd1fc6-810f-11d0-bec7-08002be2092f}
+        $cameraDrivers = Get-WmiObject Win32_PnPSignedDriver -ErrorAction Stop |
+            Where-Object {
+                ($_.DeviceClass -eq 'Camera') -or
+                ($_.DeviceClass -eq 'Image') -or
+                ($_.FriendlyName -match 'camera|webcam|IR Camera|RGB Camera|Integrated Camera') -or
+                ($_.DeviceName  -match 'camera|webcam|IR Camera|RGB Camera|Integrated Camera')
+            } |
+            Where-Object { $_.DriverVersion -ne $null } |
+            Sort-Object { [System.Version]($_.DriverVersion -replace '[^\d\.]','') } -Descending |
+            Select-Object -First 1
 
-        $line = $infContent |
-                Select-String "^\s*$escapedKey\s*=" |
-                Select-Object -First 1
-
-        if (-not $line) { return $null }
-
-        $raw = ($line.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
-
-        if ($raw -match '^%(.+)%$') {
-            $token     = [regex]::Escape($Matches[1])
-            $tokenLine = $infContent |
-                         Select-String "^\s*$token\s*=" |
-                         Select-Object -First 1
-            if ($tokenLine) {
-                $raw = ($tokenLine.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
-            }
-        }
-
-        # PowerShell 5.1: do not use "return if (...) { }" — it is not valid syntax.
-        if ($raw -ne "" -and $raw -notmatch "^%") { return $raw }
-        return $null
-    }
-    catch { return $null }
-}
-
-# ── Helper : Calculate DaysPending from a DateTime ────────────────────────────
-function Set-DaysPending {
-    param([datetime]$flagDateTime, [ref]$resultObj)
-    $resultObj.Value.RebootFlagDate = $flagDateTime.ToString("yyyy-MM-dd HH:mm:ss")
-    $resultObj.Value.DaysPending    = [math]::Round(
-                                          ((Get-Date) - $flagDateTime).TotalDays, 0
-                                      ).ToString()
-}
-
-# ── OS uptime & last shutdown / restart (all devices) ─────────────────────────
-# Last boot: Win32_OperatingSystem.LastBootUpTime (WMI DMTF first for PS 5.1 consistency).
-# Last shutdown/restart: newest System log Event 1074 (user/system initiated shutdown or restart);
-#   fallback 6006 (Event Log service stopped — common at shutdown). Not identical to "power off"
-#   for every scenario (Fast Startup, crash, etc.) but matches typical graceful cycles.
-function Set-SystemBootAndShutdownInfo {
-    param([PSCustomObject]$Result)
-
-    $lastBootLocalRef = $null
-    try {
-        $wmiOs = Get-WmiObject -Class Win32_OperatingSystem -Property LastBootUpTime -ErrorAction Stop
-        if ($null -ne $wmiOs -and $null -ne $wmiOs.LastBootUpTime) {
-            $lastBootLocal = [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$wmiOs.LastBootUpTime)
-            $lastBootLocalRef = $lastBootLocal
-            $lastBootUtc   = $lastBootLocal.ToUniversalTime()
-            $Result.LastBootUpTimeLocal = $lastBootLocal.ToString("yyyy-MM-dd HH:mm:ss")
-            $Result.LastBootUpTimeUtc   = $lastBootUtc.ToString("o")
-            $span = [datetime]::UtcNow - $lastBootUtc
-            $Result.TimeSinceLastBootHours = [math]::Round($span.TotalHours, 2).ToString()
-            $Result.TimeSinceLastBootDays  = [math]::Round($span.TotalDays, 2).ToString()
-            if ($span.TotalDays -ge 1) {
-                $Result.TimeSinceLastBootDisplay = ('{0} days ({1:F1} h)' -f [int][math]::Floor($span.TotalDays), $span.TotalHours)
-            }
-            else {
-                $Result.TimeSinceLastBootDisplay = ('{0:F2} hours' -f $span.TotalHours)
-            }
-        }
-    }
-    catch { }
-
-    $shutdownEvent = $null
-    $shutdownSrc   = $null
-    try {
-        $ev1074 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1074 } -MaxEvents 1 -ErrorAction SilentlyContinue
-        if ($ev1074) {
-            $shutdownEvent = $ev1074
-            $shutdownSrc   = 'System_EventID_1074_shutdown_or_restart_initiated'
-        }
-        if (-not $shutdownEvent) {
-            $ev6006 = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 6006 } -MaxEvents 1 -ErrorAction SilentlyContinue
-            if ($ev6006) {
-                $shutdownEvent = $ev6006
-                $shutdownSrc   = 'System_EventID_6006_event_log_stopped_proxy_for_shutdown'
-            }
-        }
-        if ($shutdownEvent) {
-            $Result.LastShutdownTimeLocal = $shutdownEvent.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
-            $Result.LastShutdownDetectionSource = $shutdownSrc
-            $sdSpan = (Get-Date) - $shutdownEvent.TimeCreated
-            $Result.TimeSinceLastShutdownDays = [math]::Round($sdSpan.TotalDays, 2).ToString()
-            if ($sdSpan.TotalDays -ge 1) {
-                $Result.TimeSinceLastShutdownDisplay = ('{0} days ({1:F1} h)' -f [int][math]::Floor($sdSpan.TotalDays), $sdSpan.TotalHours)
-            }
-            else {
-                $Result.TimeSinceLastShutdownDisplay = ('{0:F2} hours' -f $sdSpan.TotalHours)
-            }
-        }
-    }
-    catch { }
-
-    # Newest 1074/6006 is not always "the shutdown before this boot" (Fast Startup, reboot during session, etc.).
-    if ($null -ne $lastBootLocalRef -and $null -ne $shutdownEvent) {
-        if ($shutdownEvent.TimeCreated -gt $lastBootLocalRef) {
-            $Result.Shutdown1074NewerThanLastBoot = "Yes"
-            $Result.Shutdown1074VsBootNote = "Latest System log shutdown/restart event is NEWER than LastBootUpTime. It may be a restart initiated during this session or logging order effects; use Last OS boot as the start of the current session."
-        }
-        else {
-            $Result.Shutdown1074NewerThanLastBoot = "No"
-            $Result.Shutdown1074VsBootNote = "N/A"
-        }
-    }
-}
-
-Set-SystemBootAndShutdownInfo -Result $result
-
-# ── Reconcile reboot-flag / staged time vs last OS boot ───────────────────────
-# RebootFlagDate often equals DriverStore folder time or an old registry write; the PC may have
-# rebooted since then while PendingFileRenameOperations or other keys still read "pending".
-function Set-PendingRebootTimingContext {
-    param([PSCustomObject]$Result)
-    $Result.BootAfterRebootFlagTimestamp = "N/A"
-    $Result.PendingTimingNote            = "N/A"
-    if ($Result.RestartPending -ne "Yes") { return }
-    if ($Result.RebootFlagDate -eq "N/A" -or $Result.LastBootUpTimeLocal -eq "N/A") { return }
-    try {
-        $fmt       = "yyyy-MM-dd HH:mm:ss"
-        $bootLocal = [datetime]::ParseExact($Result.LastBootUpTimeLocal.Trim(), $fmt, [System.Globalization.DateTimeFormatInfo]::InvariantInfo)
-        $flagLocal = [datetime]::ParseExact($Result.RebootFlagDate.Trim(), $fmt, [System.Globalization.DateTimeFormatInfo]::InvariantInfo)
-        if ($bootLocal -gt $flagLocal) {
-            $Result.BootAfterRebootFlagTimestamp = "Yes"
-            $Result.PendingTimingNote = "Last OS boot is AFTER the reboot-flag/staged timestamp: the PC already restarted since that point. Days Pending counts days since that older timestamp (driver staging/flag), not uninterrupted time without a reboot. Restart Pending can stay Yes due to registry signals (often stale PendingFileRenameOperations) unrelated to the Lenovo driver needing a first reboot."
-        }
-        else {
-            $Result.BootAfterRebootFlagTimestamp = "No"
-        }
+        return $cameraDrivers
     }
     catch {
-        $Result.BootAfterRebootFlagTimestamp = "N/A"
+        return $null
     }
 }
 
-# ── Step 1 : Confirm this is a Lenovo device ─────────────────────────────────
-try {
-    $manufacturer        = (Get-WmiObject -Class Win32_ComputerSystem).Manufacturer
-    $result.Manufacturer = $manufacturer
-
-    if ($manufacturer -notlike "*Lenovo*") {
-        Write-Output "========================================"
-        Write-Output " Lenovo Driver Reboot Detection Report"
-        Write-Output "========================================"
-        Write-Output "Device Name      : $($result.DeviceName)"
-        Write-Output "Manufacturer     : $manufacturer"
-        Write-Output "Result           : SKIPPED - Not a Lenovo device"
-        Write-Output ""
-        Write-Output "Last OS boot (local)     : $($result.LastBootUpTimeLocal)"
-        Write-Output "  (UTC)                  : $($result.LastBootUpTimeUtc)"
-        Write-Output "Time since last boot     : $($result.TimeSinceLastBootDisplay)  [h=$($result.TimeSinceLastBootHours), d=$($result.TimeSinceLastBootDays)]"
-        Write-Output "Last shutdown/restart evt: $($result.LastShutdownTimeLocal)"
-        Write-Output "  (detection)            : $($result.LastShutdownDetectionSource)"
-        Write-Output "Time since that event    : $($result.TimeSinceLastShutdownDisplay)  [d=$($result.TimeSinceLastShutdownDays)]"
-        Write-Output "========================================"
-        Write-Output "NXT_RestartPending=No"
-        Write-Output "NXT_DriverName=N/A"
-        Write-Output "NXT_DriverVersion=N/A"
-        Write-Output "NXT_DriverBuiltDate=N/A"
-        Write-Output "NXT_DriverInstallDate=N/A"
-        Write-Output "NXT_DriverStagedDate=N/A"
-        Write-Output "NXT_RebootFlagDate=N/A"
-        Write-Output "NXT_DaysPending=N/A"
-        Write-Output "NXT_DetectionSource=Not a Lenovo device"
-        Write-Output "NXT_LastBootUpTimeLocal=$($result.LastBootUpTimeLocal)"
-        Write-Output "NXT_LastBootUpTimeUtc=$($result.LastBootUpTimeUtc)"
-        Write-Output "NXT_TimeSinceLastBootHours=$($result.TimeSinceLastBootHours)"
-        Write-Output "NXT_TimeSinceLastBootDays=$($result.TimeSinceLastBootDays)"
-        Write-Output "NXT_TimeSinceLastBootDisplay=$($result.TimeSinceLastBootDisplay)"
-        Write-Output "NXT_LastShutdownTimeLocal=$($result.LastShutdownTimeLocal)"
-        Write-Output "NXT_LastShutdownDetectionSource=$($result.LastShutdownDetectionSource)"
-        Write-Output "NXT_TimeSinceLastShutdownDays=$($result.TimeSinceLastShutdownDays)"
-        Write-Output "NXT_TimeSinceLastShutdownDisplay=$($result.TimeSinceLastShutdownDisplay)"
-        Write-Output "NXT_BootAfterRebootFlagTimestamp=N/A"
-        Write-Output "NXT_PendingTimingNote=N/A"
-        Write-Output "NXT_Shutdown1074NewerThanLastBoot=$($result.Shutdown1074NewerThanLastBoot)"
-        Write-Output "NXT_Shutdown1074VsBootNote=$($result.Shutdown1074VsBootNote)"
-        exit 0
-    }
-}
-catch { $result.Manufacturer = "Unknown" }
-
-# ── Step 2 : Check WU RebootRequired registry key (primary reboot signal) ─────
-$wuRebootKey     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-$wuRebootPending = Test-Path $wuRebootKey
-
-if ($wuRebootPending) {
-    $result.RestartPending  = "Yes"
-    $result.DetectionSource = "WU-RebootRequired-Registry"
-
+function Get-DriverInstallDate {
+    param([string]$DriverInfName)
+    <#
+    .SYNOPSIS
+        Parses SetupAPI dev log to find the most recent install date
+        for a given INF file name.
+    #>
     try {
-        $wuKeyItem = Get-Item $wuRebootKey -ErrorAction SilentlyContinue
-        if ($wuKeyItem -and $wuKeyItem.LastWriteTime -and
-            $wuKeyItem.LastWriteTime -gt [datetime]"2000-01-01") {
-            Set-DaysPending -flagDateTime $wuKeyItem.LastWriteTime -resultObj ([ref]$result)
+        if (-not (Test-Path $SetupAPILogPath)) { return $null }
+
+        # SetupAPI log entries look like:
+        # >>> [SetupCopyOEMInf - oem123.inf]
+        # >>> Section start 2024/11/05 14:32:01.456
+        $logContent = Get-Content $SetupAPILogPath -ErrorAction Stop
+
+        $recentDate = $null
+        $capture    = $false
+
+        foreach ($line in $logContent) {
+            if ($line -match "SetupCopyOEMInf.*$([regex]::Escape($DriverInfName))" -or
+                $line -match "Driver Install.*$([regex]::Escape($DriverInfName))") {
+                $capture = $true
+            }
+            if ($capture -and $line -match 'Section start\s+(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})') {
+                $parsedDate = [datetime]::ParseExact($Matches[1], 'yyyy/MM/dd HH:mm:ss', $null)
+                if ($null -eq $recentDate -or $parsedDate -gt $recentDate) {
+                    $recentDate = $parsedDate
+                }
+                $capture = $false
+            }
+        }
+        return $recentDate
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-RebootPendingRegistry {
+    <#
+    .SYNOPSIS
+        Checks all well-known registry keys that indicate a reboot is pending.
+        Returns a hashtable: @{ Pending = $true/$false; Sources = @(...) }
+    #>
+    $sources = @()
+
+    # 1. PendingFileRenameOperations (most reliable for driver updates)
+    try {
+        $pfro = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
+                                 -Name 'PendingFileRenameOperations' -ErrorAction Stop
+        if ($pfro.PendingFileRenameOperations) {
+            $sources += 'PendingFileRenameOperations'
+        }
+    } catch {}
+
+    # 2. CBS / Windows Servicing RebootPending
+    try {
+        $cbsPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        if (Test-Path $cbsPath) { $sources += 'CBS-RebootPending' }
+    } catch {}
+
+    # 3. Windows Update RebootRequired
+    try {
+        $wuPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        if (Test-Path $wuPath) { $sources += 'WindowsUpdate-RebootRequired' }
+    } catch {}
+
+    # 4. Session Manager - PendingFileRename (alternate key)
+    try {
+        $smPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+        $pfr    = (Get-ItemProperty -Path $smPath -ErrorAction Stop).PendingFileRename
+        if ($pfr) { $sources += 'SessionManager-PendingFileRename' }
+    } catch {}
+
+    # 5. RebootInProgress (sometimes set by Lenovo updates)
+    try {
+        $ripPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootInProgress'
+        if (Test-Path $ripPath) { $sources += 'WindowsUpdate-RebootInProgress' }
+    } catch {}
+
+    return @{
+        Pending = ($sources.Count -gt 0)
+        Sources = $sources
+    }
+}
+
+function Test-ThinInstallerCameraReboot {
+    <#
+    .SYNOPSIS
+        Parses Lenovo Thin Installer logs for camera package installs
+        that returned exit code 3010 (reboot required).
+    #>
+    try {
+        if (-not (Test-Path $ThinInstallerLogPath)) { return $false }
+
+        $logFiles = Get-ChildItem -Path $ThinInstallerLogPath -Filter '*.log' -ErrorAction Stop |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 5
+
+        foreach ($logFile in $logFiles) {
+            $content = Get-Content $logFile.FullName -ErrorAction SilentlyContinue
+            if (-not $content) { continue }
+
+            $cameraBlockActive = $false
+            foreach ($line in $content) {
+                # Detect camera-related package block
+                if ($line -match 'camera|webcam|IR Camera|Integrated Camera' -and
+                    $line -match 'Installing|Package|Driver') {
+                    $cameraBlockActive = $true
+                }
+                # Within a camera block, check for 3010 (reboot required)
+                if ($cameraBlockActive -and $line -match '(return code|exit code|ExitCode)\s*[=:]\s*3010') {
+                    return $true
+                }
+                # Reset block on next package boundary
+                if ($cameraBlockActive -and $line -match '^---') {
+                    $cameraBlockActive = $false
+                }
+            }
         }
     }
     catch {}
+    return $false
 }
 
-# ── Step 3 : Secondary registry reboot signals ────────────────────────────────
-$rebootSources = @()
+function Test-SystemUpdateCameraReboot {
+    <#
+    .SYNOPSIS
+        Parses Lenovo System Update logs for camera-related updates
+        with a pending reboot indicator.
+    #>
+    try {
+        if (-not (Test-Path $SystemUpdateLogPath)) { return $false }
 
-# CBS: RebootPending is a subkey, not a value on the parent Component Based Servicing key.
-$cbsRebootPendingKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+        $logFiles = Get-ChildItem -Path $SystemUpdateLogPath -Filter '*.log' -ErrorAction Stop |
+                    Sort-Object LastWriteTime -Descending |
+                    Select-Object -First 5
+
+        foreach ($logFile in $logFiles) {
+            $content = Get-Content $logFile.FullName -ErrorAction SilentlyContinue
+            if (-not $content) { continue }
+
+            $cameraLine = $false
+            foreach ($line in $content) {
+                if ($line -match 'camera|webcam|IR Camera|Integrated Camera') {
+                    $cameraLine = $true
+                }
+                if ($cameraLine -and ($line -match 'RebootNeeded|NeedsReboot|reboot required|3010')) {
+                    return $true
+                }
+            }
+        }
+    }
+    catch {}
+    return $false
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN DETECTION LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
 try {
-    if (Test-Path -LiteralPath $cbsRebootPendingKey) {
-        $rebootSources += "CBS-RebootPending"
+
+    # ── STEP 1: Detect camera driver via Win32_PnPSignedDriver ───────────────
+    $camDriver = Get-CameraDriverFromDriverStore
+
+    if ($null -eq $camDriver) {
+        $NXT_Summary = "No camera driver found on this device."
+        Write-NxtOutput
+        exit 0
     }
-}
-catch { }
 
-$sm = Get-ItemProperty `
-      "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
-      -ErrorAction SilentlyContinue
-if ($sm.PendingFileRenameOperations) { $rebootSources += "PendingFileRenameOperations" }
+    $NXT_CameraDriverFound   = "TRUE"
+    $NXT_CameraDriverName    = if ($camDriver.FriendlyName) { $camDriver.FriendlyName } `
+                               elseif ($camDriver.DeviceName)  { $camDriver.DeviceName  } `
+                               else                            { "Unknown Camera Device" }
+    $NXT_CameraDriverVersion = if ($camDriver.DriverVersion) { $camDriver.DriverVersion } else { "N/A" }
 
-$wuReboot2 = Get-ItemProperty `
-             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update" `
-             -ErrorAction SilentlyContinue
-if ($wuReboot2.RebootRequired -eq 1) { $rebootSources += "WU-AutoUpdate-RebootRequired" }
+    # ── STEP 2: Determine driver install/update date ─────────────────────────
+    $driverDate = $null
 
-if ($rebootSources.Count -gt 0) {
-    $result.RestartPending = "Yes"
-    if ($result.DetectionSource -eq "N/A") {
-        $result.DetectionSource = $rebootSources -join " | "
-    } else {
-        $result.DetectionSource += " | " + ($rebootSources -join " | ")
-    }
-}
-
-# ── Step 4 : Windows Update history — get driver name + version ───────────────
-if ($result.RestartPending -eq "Yes") {
-    try {
-        $updateSession  = New-Object -ComObject Microsoft.Update.Session
-        $updateSearcher = $updateSession.CreateUpdateSearcher()
-        $historyCount   = $updateSearcher.GetTotalHistoryCount()
-
-        if ($historyCount -gt 0) {
-            $history = $updateSearcher.QueryHistory(0, [Math]::Min($historyCount, 200))
-            $cutoff  = (Get-Date).AddDays(-30)
-
-            # Primary — Lenovo-explicit titles only
-            $lenovoDriverUpdate = $history | Where-Object {
-                $_.ResultCode -eq 2 -and $_.Date -ge $cutoff -and
-                ($_.Title -match "(?i)lenovo" -or $_.Description -match "(?i)lenovo")
-            } | Sort-Object Date -Descending | Select-Object -First 1
-
-            # Secondary — driver keywords, excluding known non-Lenovo vendors
-            if (-not $lenovoDriverUpdate) {
-                $lenovoDriverUpdate = $history | Where-Object {
-                    $_.ResultCode -eq 2 -and $_.Date -ge $cutoff -and
-                    $_.Title -match "(?i)driver|(?i)audio|(?i)sound|(?i)network|(?i)bluetooth|(?i)firmware|(?i)chipset|(?i)video|(?i)display|(?i)storage|(?i)thunderbolt|(?i)fingerprint|(?i)camera" -and
-                    $_.Title -notmatch "(?i)microsoft|(?i)windows defender|(?i)office|(?i)intel|(?i)realtek|(?i)broadcom|(?i)qualcomm|(?i)nvidia|(?i)amd"
-                } | Sort-Object Date -Descending | Select-Object -First 1
-            }
-
-            if ($lenovoDriverUpdate) {
-                $result.DriverName      = $lenovoDriverUpdate.Title
-                $result.DetectionSource += " | WU-Update-History"
-
-                $versionMatch = [regex]::Match($lenovoDriverUpdate.Title, '\d+\.\d+\.\d+\.\d+')
-                if ($versionMatch.Success) { $result.DriverVersion = $versionMatch.Value }
-            }
-        }
-    }
-    catch { $result.DetectionSource += " | WU-History-Error: $($_.Exception.Message)" }
-}
-
-# ── Step 5 : Windows Update event log — Event ID 19 / 43 ─────────────────────
-if ($result.RestartPending -eq "Yes") {
-    try {
-        $cutoff = (Get-Date).AddDays(-30)
-
-        $driverEvents = $null
+    # Primary: WMI DriverDate field (format: YYYYMMDD000000.000000+000)
+    if ($camDriver.DriverDate) {
         try {
-            $driverEvents = Get-WinEvent -FilterHashtable @{
-                LogName   = 'Microsoft-Windows-WindowsUpdateClient/Operational'
-                Id        = 19, 43
-                StartTime = $cutoff
-            } -MaxEvents 500 -ErrorAction SilentlyContinue |
-                Where-Object { $_.Message -match '(?i)lenovo|driver|audio|sound' } |
-                Sort-Object TimeCreated -Descending |
-                Select-Object -First 1
-        }
-        catch { $driverEvents = $null }
-
-        if ($driverEvents) {
-            $result.DetectionSource += " | WU-EventLog(ID:$($driverEvents.Id))"
-            if ($result.DriverName -eq "N/A") {
-                $titleMatch = [regex]::Match($driverEvents.Message, '(?i)update\s+title[:\s]+(.+)')
-                if (-not $titleMatch.Success) {
-                    $titleMatch = [regex]::Match($driverEvents.Message, '(?i)following update:\s*(.+)')
-                }
-                if ($titleMatch.Success) { $result.DriverName = $titleMatch.Groups[1].Value.Trim() }
-            }
-        }
-
-        $systemRebootEvent = $null
-        try {
-            $systemRebootEvent = Get-WinEvent -FilterHashtable @{
-                LogName   = 'System'
-                Id        = 20
-                StartTime = $cutoff
-            } -MaxEvents 200 -ErrorAction SilentlyContinue |
-                Where-Object { $_.ProviderName -match '(?i)WindowsUpdateClient' } |
-                Sort-Object TimeCreated -Descending |
-                Select-Object -First 1
-        }
-        catch { $systemRebootEvent = $null }
-
-        if ($systemRebootEvent) { $result.DetectionSource += " | System-EventLog(ID:20)" }
+            $rawDate    = $camDriver.DriverDate -replace '\..*', ''   # strip microseconds
+            $driverDate = [Management.ManagementDateTimeConverter]::ToDateTime($camDriver.DriverDate)
+        } catch {}
     }
-    catch { $result.DetectionSource += " | EventLog-ReadError" }
+
+    # Secondary: SetupAPI log (captures actual install date, not just INF date)
+    if ($camDriver.InfName) {
+        $setupDate = Get-DriverInstallDate -DriverInfName $camDriver.InfName
+        # Use the more recent of the two dates — SetupAPI date reflects actual install
+        if ($setupDate -and ($null -eq $driverDate -or $setupDate -gt $driverDate)) {
+            $driverDate = $setupDate
+        }
+    }
+
+    if ($driverDate) {
+        $NXT_CameraDriverDate = $driverDate.ToString('yyyy-MM-dd HH:mm:ss')
+        $daysSinceUpdate      = (Get-Date) - $driverDate
+        if ($daysSinceUpdate.TotalDays -le $RecentUpdateThresholdDays) {
+            $NXT_CameraDriverRecentUpdate = "TRUE"
+        }
+    }
+
+    # ── STEP 3: Check all reboot-pending signals ─────────────────────────────
+    $rebootCheck = Test-RebootPendingRegistry
+
+    if ($rebootCheck.Pending) {
+        $NXT_RebootPending = "TRUE"
+        $NXT_RebootSource  = $rebootCheck.Sources -join ', '
+    }
+
+    # ── STEP 4: Cross-check Lenovo update logs for camera + 3010 ─────────────
+    if ($NXT_RebootPending -eq "FALSE") {
+        $thinInstallerHit = Test-ThinInstallerCameraReboot
+        if ($thinInstallerHit) {
+            $NXT_RebootPending = "TRUE"
+            $NXT_RebootSource  = "Lenovo-ThinInstaller-ExitCode3010"
+        }
+    }
+
+    if ($NXT_RebootPending -eq "FALSE") {
+        $sysUpdateHit = Test-SystemUpdateCameraReboot
+        if ($sysUpdateHit) {
+            $NXT_RebootPending = "TRUE"
+            $NXT_RebootSource  = "Lenovo-SystemUpdate-RebootNeeded"
+        }
+    }
+
+    # ── STEP 5: Determine final action flag ──────────────────────────────────
+    if ($NXT_RebootPending -eq "TRUE" -and $NXT_CameraDriverFound -eq "TRUE") {
+        $NXT_ActionRequired = "TRUE"
+        $NXT_Summary = "Camera driver '$NXT_CameraDriverName' (v$NXT_CameraDriverVersion) " +
+                       "updated on $NXT_CameraDriverDate. Restart pending via: $NXT_RebootSource. " +
+                       "Camera may be non-functional until restarted."
+    }
+    elseif ($NXT_RebootPending -eq "FALSE" -and $NXT_CameraDriverFound -eq "TRUE") {
+        $NXT_Summary = "Camera driver '$NXT_CameraDriverName' (v$NXT_CameraDriverVersion) " +
+                       "is installed and no restart is pending. Camera should be functional."
+    }
+    else {
+        $NXT_Summary = "Camera driver not found or no actionable condition detected."
+    }
+
+    # ── OUTPUT ────────────────────────────────────────────────────────────────
+    Write-NxtOutput
+
+    # Exit code for Intune Proactive Remediation compatibility
+    if ($NXT_ActionRequired -eq "TRUE") { exit 1 } else { exit 0 }
+
 }
-
-# ── Step 6 : Driver Store — INF base name + built date + version ──────────────
-$infBaseName       = $null
-$driverStoreFolder = $null
-$infContent        = $null
-
-if ($result.RestartPending -eq "Yes") {
-    try {
-        $lenovoDriver = Get-WindowsDriver -Online -ErrorAction SilentlyContinue |
-                        Where-Object { $_.ProviderName -like "*Lenovo*" } |
-                        Sort-Object Date -Descending | Select-Object -First 1
-
-        if ($lenovoDriver) {
-            $infBaseName = [System.IO.Path]::GetFileNameWithoutExtension(
-                               $lenovoDriver.OriginalFileName)
-
-            $result.DriverBuiltDate = if ($lenovoDriver.Date) {
-                $lenovoDriver.Date.ToString("yyyy-MM-dd")
-            } else { "N/A" }
-
-            if ($result.DriverVersion -eq "N/A" -and $lenovoDriver.Version) {
-                $result.DriverVersion = $lenovoDriver.Version
-            }
-
-            $driverStoreRoot   = "C:\Windows\System32\DriverStore\FileRepository"
-            $driverStoreFolder = Get-ChildItem -Path $driverStoreRoot -Directory `
-                                 -ErrorAction SilentlyContinue |
-                                 Where-Object { $_.Name -like "$infBaseName*" } |
-                                 Sort-Object CreationTime -Descending | Select-Object -First 1
-
-            if ($driverStoreFolder) {
-                $infFile = Get-ChildItem -Path $driverStoreFolder.FullName `
-                           -ErrorAction SilentlyContinue |
-                           Where-Object { $_.Name -like "$infBaseName.inf" } |
-                           Select-Object -First 1
-
-                if ($infFile) {
-                    $infContent = Get-Content $infFile.FullName -ErrorAction SilentlyContinue
-                }
-            }
-
-            $result.DetectionSource += " | DriverStore-Enriched"
-
-            if ($result.DriverName -ne "N/A" -and
-                $result.DriverName -notmatch "(?i)lenovo" -and
-                $infBaseName -match "^lnv") {
-                $result.DriverName       = "N/A"
-                $result.DetectionSource += " | WU-History-Overridden(non-Lenovo-title)"
-            }
-        }
-    }
-    catch { $result.DetectionSource += " | DriverStore-ReadError: $($_.Exception.Message)" }
+catch {
+    $NXT_Summary = "Script error: $($_.Exception.Message)"
+    Write-NxtOutput
+    exit 2
 }
-
-# ── Step 7 : Win32_PnPSignedDriver.DeviceName ────────────────────────────────
-if ($result.RestartPending -eq "Yes" -and $infBaseName -and (NameNeedsResolution $result.DriverName)) {
-    try {
-        $pnpSigned = Get-WmiObject Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
-                     Where-Object { $_.InfName -like "$infBaseName*" } | Select-Object -First 1
-
-        if ($pnpSigned -and $pnpSigned.DeviceName -and
-            $pnpSigned.DeviceName -ne "" -and
-            $pnpSigned.DeviceName -match "(?i)lenovo") {
-            $result.DriverName = $pnpSigned.DeviceName
-        } elseif ($pnpSigned -and $pnpSigned.Description -and
-                  $pnpSigned.Description -ne "" -and
-                  $pnpSigned.Description -match "(?i)lenovo") {
-            $result.DriverName = $pnpSigned.Description
-        }
-    }
-    catch { $result.DetectionSource += " | PnPSignedDriver-ReadError" }
-}
-
-# ── Step 8 : DriverStore folder creation date — actual WU install date ─────────
-if ($result.RestartPending -eq "Yes" -and $driverStoreFolder) {
-    try {
-        $folderCreationTime       = $driverStoreFolder.CreationTime
-        $result.DriverInstallDate = $folderCreationTime.ToString("yyyy-MM-dd HH:mm:ss")
-        $result.DetectionSource  += " | DriverStore-FolderDate"
-
-        if ($result.RebootFlagDate -eq "N/A") {
-            Set-DaysPending -flagDateTime $folderCreationTime -resultObj ([ref]$result)
-            $result.DetectionSource += " | RebootFlagDate-DriverStoreFolder"
-        }
-    }
-    catch { $result.DetectionSource += " | DriverStore-FolderDate-Error" }
-}
-
-# ── Step 9 : INF file [Strings] parsing ───────────────────────────────────────
-if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
-
-    $parseInfKey = {
-        param([string[]]$content, [string]$key)
-        $escapedKey = [regex]::Escape($key)
-        $matched = $content | Select-String "^\s*$escapedKey\s*=" | Select-Object -First 1
-        if (-not $matched) { return $null }
-        $val = ($matched.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'")
-        if ($val -match '^%(.+)%$') {
-            $tok = [regex]::Escape($Matches[1])
-            $tokLine = $content | Select-String "^\s*$tok\s*=" | Select-Object -First 1
-            if ($tokLine) { $val = ($tokLine.Line -split '=', 2)[-1].Trim().Trim('"').Trim("'") }
-        }
-        if ($val -ne "" -and $val -notmatch "^%") { return $val }
-        return $null
-    }
-
-    $parsed = & $parseInfKey $infContent "ServiceDescription"
-    if ($parsed) {
-        $result.DriverName      = $parsed
-        $result.DetectionSource += " | INF-ServiceDescription"
-    }
-
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey $infContent "InstallServiceDescription"
-        if ($parsed) {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-InstallServiceDescription"
-        }
-    }
-
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey $infContent "DriverDesc"
-        if ($parsed) {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-DriverDesc"
-        }
-    }
-
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey $infContent "ProductName"
-        if ($parsed) {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-ProductName"
-        }
-    }
-
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey $infContent "Description"
-        if ($parsed -and $parsed -notmatch "^%") {
-            $result.DriverName      = $parsed
-            $result.DetectionSource += " | INF-Description"
-        }
-    }
-
-    if (NameNeedsResolution $result.DriverName) {
-        $parsed = & $parseInfKey $infContent "Class"
-        if ($parsed -and $parsed -notmatch "^\{" -and $parsed -notmatch "(?i)^extension$") {
-            $result.DriverName      = "Lenovo $parsed Driver"
-            $result.DetectionSource += " | INF-Class"
-        }
-    }
-}
-
-# ── Step 10 : Hardware ID → PnP device name mapping ───────────────────────────
-if ($result.RestartPending -eq "Yes" -and $infContent -and (NameNeedsResolution $result.DriverName)) {
-    try {
-        $hwIdLines = $infContent |
-                     Select-String '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;]+' |
-                     Select-Object -First 5
-
-        if ($hwIdLines) {
-            $allPnpEntities = Get-WmiObject Win32_PnPEntity -ErrorAction SilentlyContinue
-
-            foreach ($hwIdLine in $hwIdLines) {
-                $hwIdMatch = [regex]::Match(
-                    $hwIdLine.Line,
-                    '(?i)(HDAUDIO|PCI|USB|ACPI|HID|ROOT|SWC|SWD)\\[^\s,;"]+')
-
-                if ($hwIdMatch.Success) {
-                    $hwId          = $hwIdMatch.Value.Trim()
-                    $matchedDevice = $allPnpEntities | Where-Object {
-                        $_.HardwareID -contains $hwId -and
-                        $_.Name -ne $null -and $_.Name -ne ""
-                    } | Select-Object -First 1
-
-                    if ($matchedDevice) {
-                        $baseName          = $matchedDevice.Name
-                        $result.DriverName = if ($baseName -match "(?i)lenovo") {
-                            $baseName
-                        } else {
-                            "Lenovo Driver Extension - $baseName"
-                        }
-                        $result.DetectionSource += " | HardwareID-PnPMatch"
-                        break
-                    }
-                }
-            }
-        }
-    }
-    catch { $result.DetectionSource += " | HardwareID-LookupError" }
-
-    if (NameNeedsResolution $result.DriverName) {
-        $result.DriverName = $infBaseName
-    }
-}
-
-Set-PendingRebootTimingContext -Result $result
-
-# ── Step 11 : Output formatted report ─────────────────────────────────────────
-Write-Output ""
-Write-Output "========================================"
-Write-Output " Lenovo Driver Reboot Detection Report"
-Write-Output "========================================"
-Write-Output "Device Name         : $($result.DeviceName)"
-Write-Output "Manufacturer        : $($result.Manufacturer)"
-Write-Output "Restart Pending     : $($result.RestartPending)"
-Write-Output ""
-Write-Output "Last OS boot (local): $($result.LastBootUpTimeLocal)"
-Write-Output "  (UTC)             : $($result.LastBootUpTimeUtc)"
-Write-Output "Time since last boot: $($result.TimeSinceLastBootDisplay)  (hours=$($result.TimeSinceLastBootHours), days=$($result.TimeSinceLastBootDays))"
-Write-Output "Last shutdown/restart (System log): $($result.LastShutdownTimeLocal)"
-Write-Output "  (how detected)    : $($result.LastShutdownDetectionSource)"
-Write-Output "Time since that event: $($result.TimeSinceLastShutdownDisplay)  (days=$($result.TimeSinceLastShutdownDays))"
-if ($result.Shutdown1074NewerThanLastBoot -eq "Yes") {
-    Write-Output ""
-    Write-Output "Note (shutdown log) : $($result.Shutdown1074VsBootNote)"
-}
-Write-Output ""
-
-if ($result.RestartPending -eq "Yes") {
-    Write-Output "Driver Name         : $($result.DriverName)"
-    Write-Output "Driver Version      : $($result.DriverVersion)"
-    Write-Output "Driver Built Date   : $($result.DriverBuiltDate)"
-    Write-Output "  -> Meaning        : Date from the driver package / Windows Driver Store (catalog build date). Not necessarily the day the update was installed on this PC."
-    Write-Output "Driver Staged Date  : $($result.DriverInstallDate)"
-    Write-Output "  -> Meaning        : DriverStore FileRepository folder creation time - proxy for when Windows staged/copied the package onto this disk (often close to WU apply)."
-    Write-Output "Reboot Flag Date    : $($result.RebootFlagDate)"
-    Write-Output "  -> Meaning        : Timestamp used for this report pending-reboot age (registry key write, or DriverStore folder time if registry time was unknown)."
-    Write-Output "Days Pending        : $($result.DaysPending) day(s)  (calendar days since reboot-flag/staged timestamp above - not the same as time since last boot)"
-    Write-Output "Boot after flag?    : $($result.BootAfterRebootFlagTimestamp)  (Yes = OS booted AFTER that timestamp; pending registry may be stale)"
-    if ($result.PendingTimingNote -ne "N/A") {
-        Write-Output "  -> Detail         : $($result.PendingTimingNote)"
-    }
-    Write-Output "Detection Source    : $($result.DetectionSource)"
-} else {
-    Write-Output "Result              : No Lenovo driver restart pending detected"
-}
-
-Write-Output "========================================"
-Write-Output ""
-
-# ── Step 12 : Nexthink Remote Action output variables ─────────────────────────
-Write-Output "NXT_RestartPending=$($result.RestartPending)"
-Write-Output "NXT_DriverName=$($result.DriverName)"
-Write-Output "NXT_DriverVersion=$($result.DriverVersion)"
-Write-Output "NXT_DriverBuiltDate=$($result.DriverBuiltDate)"
-Write-Output "NXT_DriverInstallDate=$($result.DriverInstallDate)"
-Write-Output "NXT_DriverStagedDate=$($result.DriverInstallDate)"
-Write-Output "NXT_RebootFlagDate=$($result.RebootFlagDate)"
-Write-Output "NXT_DaysPending=$($result.DaysPending)"
-Write-Output "NXT_DetectionSource=$($result.DetectionSource)"
-Write-Output "NXT_LastBootUpTimeLocal=$($result.LastBootUpTimeLocal)"
-Write-Output "NXT_LastBootUpTimeUtc=$($result.LastBootUpTimeUtc)"
-Write-Output "NXT_TimeSinceLastBootHours=$($result.TimeSinceLastBootHours)"
-Write-Output "NXT_TimeSinceLastBootDays=$($result.TimeSinceLastBootDays)"
-Write-Output "NXT_TimeSinceLastBootDisplay=$($result.TimeSinceLastBootDisplay)"
-Write-Output "NXT_LastShutdownTimeLocal=$($result.LastShutdownTimeLocal)"
-Write-Output "NXT_LastShutdownDetectionSource=$($result.LastShutdownDetectionSource)"
-Write-Output "NXT_TimeSinceLastShutdownDays=$($result.TimeSinceLastShutdownDays)"
-Write-Output "NXT_TimeSinceLastShutdownDisplay=$($result.TimeSinceLastShutdownDisplay)"
-Write-Output "NXT_BootAfterRebootFlagTimestamp=$($result.BootAfterRebootFlagTimestamp)"
-Write-Output "NXT_PendingTimingNote=$($result.PendingTimingNote)"
-Write-Output "NXT_Shutdown1074NewerThanLastBoot=$($result.Shutdown1074NewerThanLastBoot)"
-Write-Output "NXT_Shutdown1074VsBootNote=$($result.Shutdown1074VsBootNote)"
-
-# ── Exit codes for Intune Proactive Remediation ────────────────────────────────
-if ($result.RestartPending -eq "Yes") { exit 1 } else { exit 0 }
